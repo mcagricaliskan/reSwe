@@ -1,4 +1,4 @@
-.PHONY: dev build clean frontend frontend-dev deps
+.PHONY: dev build clean frontend frontend-dev deps start fresh
 
 # Default target
 all: build
@@ -25,6 +25,15 @@ dev: deps
 
 # Run with embedded frontend
 run: build
+	./bin/reswe
+
+# Build and start
+start: build
+	./bin/reswe
+
+# Delete DB, rebuild, and start fresh
+fresh: build
+	rm -f ~/.reswe/data.db
 	./bin/reswe
 
 # Clean build artifacts

@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 8080, "server port")
+	port := flag.Int("port", 16147, "server port")
 	dbPath := flag.String("db", "", "database path (default: ~/.reswe/data.db)")
 	ollamaURL := flag.String("ollama-url", "http://localhost:11434", "Ollama API URL")
 	dev := flag.Bool("dev", false, "development mode (serve frontend from filesystem)")

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -15,6 +15,7 @@ export default function ProjectsPage() {
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [loading, setLoading] = useState(true)
+  const navigate = useNavigate()
 
   useEffect(() => { loadProjects() }, [])
 
@@ -33,12 +34,9 @@ export default function ProjectsPage() {
     e.preventDefault()
     if (!name.trim()) return
     try {
-      await api.createProject(name, description)
-      setName('')
-      setDescription('')
-      setShowForm(false)
+      const project = await api.createProject(name, description)
       toast.success('Project created')
-      loadProjects()
+      navigate(`/projects/${project.id}`)
     } catch {
       toast.error('Failed to create project')
     }

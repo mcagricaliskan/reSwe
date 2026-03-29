@@ -191,6 +191,51 @@ func (s *Server) handleListPlanMessages(c fiber.Ctx) error {
 	return writeJSON(c, 200, msgs)
 }
 
+func (s *Server) handlePlanAnswer(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+
+	var req struct {
+		Answers []struct {
+			QuestionID int64  `json:"question_id"`
+			Answer     string `json:"answer"`
+		} `json:"answers"`
+	}
+	if err := c.Bind().JSON(&req); err != nil {
+		return writeError(c, 400, "invalid request body")
+	}
+
+	answerMap := make(map[int64]string)
+	for _, a := range req.Answers {
+		answerMap[a.QuestionID] = a.Answer
+	}
+
+	cfg := agent.RunConfig{Provider: "ollama", Model: "qwen3.5:27b"}
+
+	go func() {
+		if err := s.orchestrator.ResumePlan(taskID, answerMap, cfg); err != nil {
+			s.hub.Broadcast(models_ws_error(taskID, err.Error()))
+		}
+	}()
+
+	return writeJSON(c, 202, fiber.Map{"status": "resuming"})
+}
+
+func (s *Server) handleGetPendingQuestions(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+
+	questions, err := s.store.ListPendingQuestions(taskID)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, questions)
+}
+
 func (s *Server) handleListSessions(c fiber.Ctx) error {
 	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
 	if err != nil {
@@ -345,7 +390,7 @@ func (s *Server) handleGetLatestRun(c fiber.Ctx) error {
 	}
 	run, err := s.store.GetLatestAgentRun(taskID)
 	if err != nil {
-		return writeJSON(c, 200, nil)
+		return writeJSON(c, 200, []interface{}{})
 	}
 	return writeJSON(c, 200, run)
 }

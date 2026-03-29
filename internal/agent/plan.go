@@ -9,7 +9,7 @@ import (
 	"github.com/cagri/reswe/internal/provider"
 )
 
-func runPlan(ctx context.Context, p provider.Provider, model string, task *models.Task, tools *ToolSet, systemPrompt string, onStep StepCallback, onStream provider.StreamCallback) (string, error) {
+func runPlan(ctx context.Context, p provider.Provider, model string, task *models.Task, tools *ToolSet, systemPrompt string, history []models.ChatMessage, onStep StepCallback, onStream provider.StreamCallback) LoopResult {
 	var extra strings.Builder
 	if task.ImplementationPlan != "" {
 		extra.WriteString(fmt.Sprintf("\n## Previous Plan (user wants revision)\n%s", task.ImplementationPlan))
@@ -30,18 +30,14 @@ Description: %s
 %s
 Explore the codebase and create an implementation plan. If anything is unclear, ask me.`, task.Title, task.Description, extra.String())
 
-	result, err := RunLoop(ctx, LoopConfig{
+	return RunLoop(ctx, LoopConfig{
 		Provider:     p,
 		Model:        model,
 		SystemPrompt: systemPrompt,
 		TaskContext:   taskContext,
+		History:      history,
 		Tools:        tools,
 		OnStep:       onStep,
 		OnStream:     onStream,
 	})
-	if err != nil {
-		return "", fmt.Errorf("plan agent: %w", err)
-	}
-
-	return result, nil
 }

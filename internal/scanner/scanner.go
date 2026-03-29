@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -35,6 +36,62 @@ var defaultIgnore = []string{
 	"*.ico", "*.svg", "*.woff", "*.woff2", "*.ttf", "*.eot",
 	"*.mp3", "*.mp4", "*.avi", "*.mov", "*.zip", "*.tar",
 	"*.gz", "*.rar", "*.7z", "*.pdf",
+}
+
+// sensitivePatterns are files the agent is never allowed to read
+var sensitivePatterns = []string{
+	".env", ".env.*",
+	"*.pem", "*.key", "*.p12", "*.pfx", "*.keystore",
+	"*.secret",
+	"credentials.json", "service-account*.json",
+	"id_rsa", "id_ed25519", "id_dsa", "id_ecdsa",
+	".npmrc", ".pypirc", ".netrc", ".docker/config.json",
+}
+
+// DefaultSensitivePatterns returns a copy of the hardcoded sensitive patterns (used as fallback).
+func DefaultSensitivePatterns() []string {
+	result := make([]string, len(sensitivePatterns))
+	copy(result, sensitivePatterns)
+	return result
+}
+
+// IsSensitive returns true if the file path matches the hardcoded sensitive patterns.
+// Use IsSensitiveFor with custom patterns from the database when available.
+func IsSensitive(path string) bool {
+	return IsSensitiveFor(path, sensitivePatterns)
+}
+
+// IsSensitiveFor returns true if the file path matches any of the given patterns.
+func IsSensitiveFor(path string, patterns []string) bool {
+	name := filepath.Base(path)
+	for _, pattern := range patterns {
+		if name == pattern {
+			return true
+		}
+		if matched, _ := filepath.Match(pattern, name); matched {
+			return true
+		}
+	}
+	return false
+}
+
+// PackageInfo represents a detected workspace package within a monorepo
+type PackageInfo struct {
+	Path    string `json:"path"`
+	Name    string `json:"name"`
+	RelPath string `json:"rel_path"`
+	Manager string `json:"manager"` // "npm", "go", "cargo", "pip", etc.
+}
+
+// FolderAnalysis is the result of analyzing a folder's structure
+type FolderAnalysis struct {
+	Path        string        `json:"path"`
+	Name        string        `json:"name"`
+	IsGit       bool          `json:"is_git"`
+	Submodules  []RepoInfo    `json:"submodules,omitempty"`
+	NestedRepos []RepoInfo    `json:"nested_repos,omitempty"`
+	Packages    []PackageInfo `json:"packages,omitempty"`
+	Type        string        `json:"type"` // "single-repo", "monorepo", "multi-repo", "plain-folder"
 }
 
 // RepoInfo represents a discovered code project (git repo or plain folder)
@@ -310,6 +367,321 @@ func (s *Scanner) loadGitignore(root string) []string {
 		patterns = append(patterns, line)
 	}
 	return patterns
+}
+
+// AnalyzeFolder inspects a folder and detects its structure:
+// git repo, submodules, nested repos, monorepo workspaces, or plain folder.
+func (s *Scanner) AnalyzeFolder(path string) (*FolderAnalysis, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("not a directory: %s", path)
+	}
+
+	a := &FolderAnalysis{
+		Path:  path,
+		Name:  filepath.Base(path),
+		IsGit: IsGitRepo(path),
+	}
+
+	// Detect submodules
+	if a.IsGit {
+		a.Submodules = detectSubmodules(path)
+	}
+
+	// Detect nested git repos (walk 2 levels, skip the root .git)
+	a.NestedRepos = detectNestedRepos(path)
+
+	// Detect monorepo workspace packages
+	a.Packages = detectPackages(path)
+
+	// Derive type
+	switch {
+	case len(a.NestedRepos) > 0 || len(a.Submodules) > 0:
+		a.Type = "multi-repo"
+	case len(a.Packages) > 0:
+		a.Type = "monorepo"
+	case a.IsGit:
+		a.Type = "single-repo"
+	default:
+		a.Type = "plain-folder"
+	}
+
+	return a, nil
+}
+
+func detectSubmodules(repoPath string) []RepoInfo {
+	cmd := execCommand("git", "-C", repoPath, "submodule", "status")
+	out, err := cmd.Output()
+	if err != nil || len(out) == 0 {
+		return nil
+	}
+
+	var subs []RepoInfo
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		// Format: " <hash> <path> (<describe>)" or "-<hash> <path>"
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+		subPath := parts[1]
+		absPath := filepath.Join(repoPath, subPath)
+		subs = append(subs, BuildRepoInfo(absPath))
+	}
+	return subs
+}
+
+func detectNestedRepos(root string) []RepoInfo {
+	var repos []RepoInfo
+	// Walk 2 levels deep looking for .git dirs
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		child := filepath.Join(root, e.Name())
+		if IsGitRepo(child) {
+			repos = append(repos, BuildRepoInfo(child))
+			continue
+		}
+		// Check one more level
+		subEntries, err := os.ReadDir(child)
+		if err != nil {
+			continue
+		}
+		for _, se := range subEntries {
+			if !se.IsDir() || strings.HasPrefix(se.Name(), ".") {
+				continue
+			}
+			grandchild := filepath.Join(child, se.Name())
+			if IsGitRepo(grandchild) {
+				repos = append(repos, BuildRepoInfo(grandchild))
+			}
+		}
+	}
+	return repos
+}
+
+func detectPackages(root string) []PackageInfo {
+	var pkgs []PackageInfo
+
+	// npm/yarn/pnpm workspaces
+	pkgs = append(pkgs, detectNpmWorkspaces(root)...)
+
+	// pnpm-workspace.yaml
+	pkgs = append(pkgs, detectPnpmWorkspaces(root)...)
+
+	// go.work
+	pkgs = append(pkgs, detectGoWorkspaces(root)...)
+
+	// Cargo workspaces
+	pkgs = append(pkgs, detectCargoWorkspaces(root)...)
+
+	return pkgs
+}
+
+func detectNpmWorkspaces(root string) []PackageInfo {
+	pkgPath := filepath.Join(root, "package.json")
+	data, err := os.ReadFile(pkgPath)
+	if err != nil {
+		return nil
+	}
+
+	var pkg struct {
+		Workspaces interface{} `json:"workspaces"`
+	}
+	if err := json.Unmarshal(data, &pkg); err != nil || pkg.Workspaces == nil {
+		return nil
+	}
+
+	// Workspaces can be []string or {"packages": []string}
+	var patterns []string
+	switch v := pkg.Workspaces.(type) {
+	case []interface{}:
+		for _, p := range v {
+			if s, ok := p.(string); ok {
+				patterns = append(patterns, s)
+			}
+		}
+	case map[string]interface{}:
+		if p, ok := v["packages"]; ok {
+			if arr, ok := p.([]interface{}); ok {
+				for _, item := range arr {
+					if s, ok := item.(string); ok {
+						patterns = append(patterns, s)
+					}
+				}
+			}
+		}
+	}
+
+	return expandWorkspaceGlobs(root, patterns, "npm")
+}
+
+func detectPnpmWorkspaces(root string) []PackageInfo {
+	wsPath := filepath.Join(root, "pnpm-workspace.yaml")
+	data, err := os.ReadFile(wsPath)
+	if err != nil {
+		return nil
+	}
+
+	// Simple YAML parsing for "packages:" list — no external dependency
+	var patterns []string
+	inPackages := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "packages:" {
+			inPackages = true
+			continue
+		}
+		if inPackages {
+			if strings.HasPrefix(trimmed, "- ") {
+				pattern := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+				pattern = strings.Trim(pattern, "'\"")
+				patterns = append(patterns, pattern)
+			} else if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				break
+			}
+		}
+	}
+
+	return expandWorkspaceGlobs(root, patterns, "pnpm")
+}
+
+func detectGoWorkspaces(root string) []PackageInfo {
+	wsPath := filepath.Join(root, "go.work")
+	data, err := os.ReadFile(wsPath)
+	if err != nil {
+		return nil
+	}
+
+	var pkgs []PackageInfo
+	inUse := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "use (" {
+			inUse = true
+			continue
+		}
+		if inUse {
+			if trimmed == ")" {
+				break
+			}
+			modPath := strings.TrimSpace(trimmed)
+			if modPath == "" || strings.HasPrefix(modPath, "//") {
+				continue
+			}
+			absPath := filepath.Join(root, modPath)
+			if info, err := os.Stat(absPath); err == nil && info.IsDir() {
+				pkgs = append(pkgs, PackageInfo{
+					Path:    absPath,
+					Name:    filepath.Base(modPath),
+					RelPath: modPath,
+					Manager: "go",
+				})
+			}
+		}
+	}
+	return pkgs
+}
+
+func detectCargoWorkspaces(root string) []PackageInfo {
+	cargoPath := filepath.Join(root, "Cargo.toml")
+	data, err := os.ReadFile(cargoPath)
+	if err != nil {
+		return nil
+	}
+
+	// Simple TOML parsing for [workspace] members
+	var patterns []string
+	inWorkspace := false
+	inMembers := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[workspace]" {
+			inWorkspace = true
+			continue
+		}
+		if inWorkspace && strings.HasPrefix(trimmed, "members") {
+			inMembers = true
+			// Could be on same line: members = ["a", "b"]
+			if idx := strings.Index(trimmed, "["); idx >= 0 {
+				content := trimmed[idx:]
+				content = strings.Trim(content, "[]")
+				for _, m := range strings.Split(content, ",") {
+					m = strings.TrimSpace(m)
+					m = strings.Trim(m, "\"'")
+					if m != "" {
+						patterns = append(patterns, m)
+					}
+				}
+				if strings.Contains(trimmed, "]") {
+					inMembers = false
+				}
+			}
+			continue
+		}
+		if inMembers {
+			if strings.Contains(trimmed, "]") {
+				inMembers = false
+				continue
+			}
+			m := strings.TrimSpace(trimmed)
+			m = strings.Trim(m, "\"',")
+			if m != "" {
+				patterns = append(patterns, m)
+			}
+		}
+		if inWorkspace && strings.HasPrefix(trimmed, "[") && trimmed != "[workspace]" {
+			break
+		}
+	}
+
+	return expandWorkspaceGlobs(root, patterns, "cargo")
+}
+
+func expandWorkspaceGlobs(root string, patterns []string, manager string) []PackageInfo {
+	var pkgs []PackageInfo
+	seen := make(map[string]bool)
+
+	for _, pattern := range patterns {
+		// Expand glob
+		matches, err := filepath.Glob(filepath.Join(root, pattern))
+		if err != nil {
+			continue
+		}
+		for _, m := range matches {
+			if seen[m] {
+				continue
+			}
+			info, err := os.Stat(m)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			seen[m] = true
+			rel, _ := filepath.Rel(root, m)
+			pkgs = append(pkgs, PackageInfo{
+				Path:    m,
+				Name:    filepath.Base(m),
+				RelPath: rel,
+				Manager: manager,
+			})
+		}
+	}
+	return pkgs
 }
 
 func matchPattern(name, relPath, pattern string) bool {

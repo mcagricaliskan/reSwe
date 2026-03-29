@@ -29,22 +29,29 @@ type ToolResult struct {
 	Tool    string `json:"tool"`
 	Success bool   `json:"success"`
 	Output  string `json:"output"`
+	Pause   bool   `json:"pause"` // if true, agent loop pauses and waits for user input
 }
 
 // ToolSet holds the available tools and the context to execute them
 type ToolSet struct {
-	scanner *scanner.Scanner
-	repos   []models.Repo
+	scanner         *scanner.Scanner
+	repos           []models.Repo
+	excludePatterns []string // configurable patterns from DB
 	// For ask_user: pending questions get emitted, answers come back later
 	pendingQuestions []string
 	userAnswers     map[string]string
 }
 
-func NewToolSet(sc *scanner.Scanner, repos []models.Repo) *ToolSet {
+func NewToolSet(sc *scanner.Scanner, repos []models.Repo, excludePatterns []string) *ToolSet {
+	// Fall back to hardcoded defaults if no patterns configured
+	if len(excludePatterns) == 0 {
+		excludePatterns = scanner.DefaultSensitivePatterns()
+	}
 	return &ToolSet{
-		scanner:     sc,
-		repos:       repos,
-		userAnswers: make(map[string]string),
+		scanner:         sc,
+		repos:           repos,
+		excludePatterns: excludePatterns,
+		userAnswers:     make(map[string]string),
 	}
 }
 
@@ -68,8 +75,8 @@ func (ts *ToolSet) Available() []Tool {
 		},
 		{
 			Name:        "ask_user",
-			Description: "Ask the user a question when you need clarification or a decision that you cannot determine from the code.",
-			Parameters:  "question: string (specific, actionable question for the user)",
+			Description: "Ask the user a question. The agent loop will PAUSE until the user answers. Use this when: requirements are ambiguous, there are multiple valid approaches, something seems risky or against best practices, or you need a decision you can't make from code alone.",
+			Parameters:  "question: string (specific, actionable question)",
 		},
 		{
 			Name:        "done",
@@ -186,6 +193,11 @@ func (ts *ToolSet) readFile(path string) ToolResult {
 		return ToolResult{Tool: "read_file", Success: false, Output: "Error: path is required"}
 	}
 
+	// Check sensitive file blocklist (uses configurable patterns)
+	if scanner.IsSensitiveFor(path, ts.excludePatterns) {
+		return ToolResult{Tool: "read_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
+	}
+
 	resolved, ok := ts.resolvePath(path)
 	if !ok {
 		// Build helpful error with available repos
@@ -198,6 +210,11 @@ func (ts *ToolSet) readFile(path string) ToolResult {
 			Success: false,
 			Output:  fmt.Sprintf("File not found: %s\nAvailable repos: %s\nUse format: repo-name/path/to/file", path, strings.Join(repos, ", ")),
 		}
+	}
+
+	// Also check the resolved absolute path
+	if scanner.IsSensitiveFor(resolved, ts.excludePatterns) {
+		return ToolResult{Tool: "read_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
 	}
 
 	content, err := ts.scanner.ReadFile(resolved, 200*1024)
@@ -228,6 +245,11 @@ func (ts *ToolSet) searchCode(query string) ToolResult {
 
 		for _, f := range files {
 			if f.IsDir || f.Size > 500*1024 {
+				continue
+			}
+
+			// Skip sensitive files (uses configurable patterns)
+			if scanner.IsSensitiveFor(f.RelPath, ts.excludePatterns) || scanner.IsSensitiveFor(f.Path, ts.excludePatterns) {
 				continue
 			}
 
@@ -358,7 +380,8 @@ func (ts *ToolSet) askUser(question string) ToolResult {
 	return ToolResult{
 		Tool:    "ask_user",
 		Success: true,
-		Output:  fmt.Sprintf("Question sent to user: %s\n(Waiting for answer...)", question),
+		Output:  fmt.Sprintf("Question sent to user: %s\n(Agent will pause and wait for answer.)", question),
+		Pause:   true,
 	}
 }
 

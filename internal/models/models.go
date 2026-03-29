@@ -43,6 +43,7 @@ type Repo struct {
 	RootCommit string    `json:"root_commit"` // hash of first commit — true stable identity across clones/renames
 	Identifier string    `json:"identifier"`  // best stable ID: root_commit > remote_url > path
 	HeadRef    string    `json:"head_ref"`    // current branch
+	Type       string    `json:"type"`        // "git" or "folder"
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
@@ -90,6 +91,18 @@ type PlanMessage struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// AgentQuestion is a question the agent asks the user during planning (pause/resume)
+type AgentQuestion struct {
+	ID        int64     `json:"id"`
+	RunID     int64     `json:"run_id"`
+	TaskID    int64     `json:"task_id"`
+	Question  string    `json:"question"`
+	Options   []string  `json:"options,omitempty"` // optional predefined choices
+	Answer    string    `json:"answer"`
+	Answered  bool      `json:"answered"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 type Execution struct {
 	ID           int64     `json:"id"`
 	TaskID       int64     `json:"task_id"`
@@ -111,15 +124,17 @@ type AgentRun struct {
 	Phase        string    `json:"phase"`
 	Provider     string    `json:"provider"`
 	Model        string    `json:"model"`
-	Status       string    `json:"status"` // running, completed, error, cancelled
-	FinalResult  string    `json:"final_result,omitempty"`
-	Error        string    `json:"error,omitempty"`
-	SystemPrompt string    `json:"system_prompt,omitempty"`
-	RepoSnapshot string    `json:"repo_snapshot,omitempty"` // JSON: repos + identifiers at time of run
-	StepCount    int       `json:"step_count"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
-	Steps        []AgentStep `json:"steps,omitempty"`
+	Status         string    `json:"status"` // running, completed, error, cancelled, waiting
+	FinalResult    string    `json:"final_result,omitempty"`
+	Error          string    `json:"error,omitempty"`
+	SystemPrompt   string    `json:"system_prompt,omitempty"`
+	RepoSnapshot   string    `json:"repo_snapshot,omitempty"`
+	PausedMessages string    `json:"paused_messages,omitempty"` // JSON: conversation history at pause point
+	StepCount      int       `json:"step_count"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Steps          []AgentStep     `json:"steps,omitempty"`
+	Questions      []AgentQuestion `json:"questions,omitempty"`
 }
 
 // AgentStep represents one think/act/observe iteration (persisted)
@@ -139,10 +154,11 @@ type AgentStep struct {
 type WSMessageType string
 
 const (
-	WSTypeAgentOutput WSMessageType = "agent_output"
-	WSTypeAgentStep   WSMessageType = "agent_step"
-	WSTypeAgentDone   WSMessageType = "agent_done"
-	WSTypeAgentError  WSMessageType = "agent_error"
+	WSTypeAgentOutput  WSMessageType = "agent_output"
+	WSTypeAgentStep    WSMessageType = "agent_step"
+	WSTypeAgentDone    WSMessageType = "agent_done"
+	WSTypeAgentError   WSMessageType = "agent_error"
+	WSTypeAgentWaiting WSMessageType = "agent_waiting"
 	WSTypeTaskUpdate  WSMessageType = "task_update"
 	WSTypeClarify     WSMessageType = "clarify"
 )
@@ -169,6 +185,47 @@ type ChatResponse struct {
 	Content  string `json:"content"`
 	Done     bool   `json:"done"`
 	Model    string `json:"model"`
+}
+
+// ExcludeRule is a single global exclude pattern with a default on/off state.
+// Managed in Settings, inherited by all projects unless overridden.
+type ExcludeRule struct {
+	ID               int64     `json:"id"`
+	Pattern          string    `json:"pattern"`
+	EnabledByDefault bool      `json:"enabled_by_default"`
+	CreatedAt        time.Time `json:"created_at"`
+}
+
+// ProjectExcludeOverride overrides a global rule's on/off state for a specific project.
+type ProjectExcludeOverride struct {
+	ID        int64 `json:"id"`
+	ProjectID int64 `json:"project_id"`
+	RuleID    int64 `json:"rule_id"`
+	Enabled   bool  `json:"enabled"`
+}
+
+// ProjectCustomPattern is a project-specific pattern (not from global rules).
+type ProjectCustomPattern struct {
+	ID        int64     `json:"id"`
+	ProjectID int64     `json:"project_id"`
+	Pattern   string    `json:"pattern"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// ResolvedRule is a global rule with its effective state for a specific project.
+type ResolvedRule struct {
+	ID               int64  `json:"id"`
+	Pattern          string `json:"pattern"`
+	EnabledByDefault bool   `json:"enabled_by_default"`
+	Enabled          bool   `json:"enabled"`  // effective: override if exists, else default
+	Overridden       bool   `json:"overridden"` // true if project has an override
+}
+
+// ProjectExcludeConfig is the full exclude configuration for a project.
+type ProjectExcludeConfig struct {
+	Rules          []ResolvedRule        `json:"rules"`
+	CustomPatterns []ProjectCustomPattern `json:"custom_patterns"`
+	Effective      []string              `json:"effective"` // all enabled patterns merged
 }
 
 // Provider config

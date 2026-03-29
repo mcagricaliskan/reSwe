@@ -9,7 +9,7 @@ import (
 	"github.com/cagri/reswe/internal/provider"
 )
 
-func runExecute(ctx context.Context, p provider.Provider, model string, task *models.Task, tools *ToolSet, systemPrompt string, onStep StepCallback, onStream provider.StreamCallback) (string, error) {
+func runExecute(ctx context.Context, p provider.Provider, model string, task *models.Task, tools *ToolSet, systemPrompt string, onStep StepCallback, onStream provider.StreamCallback) LoopResult {
 	var extra strings.Builder
 	if task.ImplementationPlan != "" {
 		extra.WriteString(fmt.Sprintf("\n## Implementation Plan\n%s", task.ImplementationPlan))
@@ -30,7 +30,7 @@ Description: %s
 %s
 Read the files and implement the changes according to the plan.`, task.Title, task.Description, extra.String())
 
-	result, err := RunLoop(ctx, LoopConfig{
+	return RunLoop(ctx, LoopConfig{
 		Provider:     p,
 		Model:        model,
 		SystemPrompt: systemPrompt,
@@ -39,9 +39,4 @@ Read the files and implement the changes according to the plan.`, task.Title, ta
 		OnStep:       onStep,
 		OnStream:     onStream,
 	})
-	if err != nil {
-		return "", fmt.Errorf("execute agent: %w", err)
-	}
-
-	return result, nil
 }

@@ -59,6 +59,7 @@ func (s *SQLiteStore) migrate() error {
 		root_commit TEXT DEFAULT '',
 		identifier TEXT DEFAULT '',
 		head_ref TEXT DEFAULT '',
+		type TEXT DEFAULT 'git',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
@@ -127,8 +128,20 @@ func (s *SQLiteStore) migrate() error {
 		system_prompt TEXT DEFAULT '',
 		repo_snapshot TEXT DEFAULT '[]',
 		step_count INTEGER DEFAULT 0,
+		paused_messages TEXT DEFAULT '',
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS agent_questions (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+		task_id INTEGER NOT NULL,
+		question TEXT NOT NULL,
+		options TEXT DEFAULT '[]',
+		answer TEXT DEFAULT '',
+		answered INTEGER DEFAULT 0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS agent_steps (
@@ -147,9 +160,64 @@ func (s *SQLiteStore) migrate() error {
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS exclude_rules (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		pattern TEXT NOT NULL UNIQUE,
+		enabled_by_default INTEGER DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS project_exclude_overrides (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		rule_id INTEGER NOT NULL REFERENCES exclude_rules(id) ON DELETE CASCADE,
+		enabled INTEGER NOT NULL,
+		UNIQUE(project_id, rule_id)
+	);
+
+	CREATE TABLE IF NOT EXISTS project_custom_patterns (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		pattern TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 	_, err := s.db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Migrations for existing databases
+	migrations := []string{
+		"ALTER TABLE repos ADD COLUMN type TEXT DEFAULT 'git'",
+	}
+	for _, m := range migrations {
+		s.db.Exec(m) // ignore errors — column may already exist
+	}
+
+	// Drop old preset tables if they exist (replaced by exclude_rules)
+	s.db.Exec("DROP TABLE IF EXISTS project_presets")
+	s.db.Exec("DROP TABLE IF EXISTS project_exclude_patterns")
+	s.db.Exec("DROP TABLE IF EXISTS exclude_presets")
+
+	// Seed default exclude rules if none exist
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM exclude_rules").Scan(&count); err == nil && count == 0 {
+		defaults := []struct{ pattern string; enabled int }{
+			{".env", 1}, {".env.*", 1},
+			{"*.pem", 1}, {"*.key", 1}, {"*.p12", 1}, {"*.pfx", 1}, {"*.keystore", 1},
+			{"*.secret", 1},
+			{"credentials.json", 1}, {"service-account*.json", 1},
+			{"id_rsa", 1}, {"id_ed25519", 1}, {"id_dsa", 1}, {"id_ecdsa", 1},
+			{".npmrc", 0}, {".pypirc", 0}, {".netrc", 0},
+		}
+		for _, d := range defaults {
+			s.db.Exec("INSERT OR IGNORE INTO exclude_rules (pattern, enabled_by_default) VALUES (?, ?)", d.pattern, d.enabled)
+		}
+	}
+
+	return nil
 }
 
 func (s *SQLiteStore) Close() error {
@@ -243,7 +311,8 @@ func (s *SQLiteStore) AddRepoFull(projectID int64, path, name, remoteURL, identi
 	now := time.Now()
 	uid := newUUID()
 
-	// Extract root commit for the true stable identity
+	// Detect type and extract git info
+	repoType := "folder"
 	rootCommit := ""
 	cmd := exec.Command("git", "-C", path, "rev-list", "--max-parents=0", "HEAD")
 	if out, err := cmd.Output(); err == nil {
@@ -251,6 +320,7 @@ func (s *SQLiteStore) AddRepoFull(projectID int64, path, name, remoteURL, identi
 		if len(lines) > 0 {
 			rootCommit = strings.TrimSpace(lines[0])
 		}
+		repoType = "git"
 	}
 
 	// Build identifier: root_commit > remote > path
@@ -263,9 +333,9 @@ func (s *SQLiteStore) AddRepoFull(projectID int64, path, name, remoteURL, identi
 	}
 
 	res, err := s.db.Exec(
-		`INSERT INTO repos (uuid, project_id, path, name, remote_url, root_commit, identifier, head_ref, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		uid, projectID, path, name, remoteURL, rootCommit, identifier, headRef, now, now,
+		`INSERT INTO repos (uuid, project_id, path, name, remote_url, root_commit, identifier, head_ref, type, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		uid, projectID, path, name, remoteURL, rootCommit, identifier, headRef, repoType, now, now,
 	)
 	if err != nil {
 		return nil, err
@@ -284,6 +354,7 @@ func (s *SQLiteStore) AddRepoFull(projectID int64, path, name, remoteURL, identi
 		RootCommit: rootCommit,
 		Identifier: identifier,
 		HeadRef:    headRef,
+		Type:       repoType,
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}, nil
@@ -303,7 +374,7 @@ func (s *SQLiteStore) SyncRepo(id int64, path, remoteURL, headRef string) error 
 
 func (s *SQLiteStore) ListRepos(projectID int64) ([]models.Repo, error) {
 	rows, err := s.db.Query(
-		`SELECT id, uuid, project_id, path, name, remote_url, root_commit, identifier, head_ref, created_at, updated_at
+		`SELECT id, uuid, project_id, path, name, remote_url, root_commit, identifier, head_ref, type, created_at, updated_at
 		 FROM repos WHERE project_id = ? ORDER BY name`, projectID,
 	)
 	if err != nil {
@@ -315,7 +386,7 @@ func (s *SQLiteStore) ListRepos(projectID int64) ([]models.Repo, error) {
 	for rows.Next() {
 		var r models.Repo
 		if err := rows.Scan(&r.ID, &r.UUID, &r.ProjectID, &r.Path, &r.Name,
-			&r.RemoteURL, &r.RootCommit, &r.Identifier, &r.HeadRef, &r.CreatedAt, &r.UpdatedAt); err != nil {
+			&r.RemoteURL, &r.RootCommit, &r.Identifier, &r.HeadRef, &r.Type, &r.CreatedAt, &r.UpdatedAt); err != nil {
 			return nil, err
 		}
 		repos = append(repos, r)
@@ -568,7 +639,7 @@ func (s *SQLiteStore) AddPlanMessage(taskID int64, role, content string) (*model
 func (s *SQLiteStore) ListPlanMessages(taskID int64) ([]models.PlanMessage, error) {
 	sess, err := s.GetActiveSession(taskID)
 	if err != nil {
-		return nil, nil // no active session = no messages
+		return []models.PlanMessage{}, nil
 	}
 	return s.listSessionMessages(sess.ID)
 }
@@ -751,18 +822,18 @@ func (s *SQLiteStore) CreateAgentRun(taskID int64, phase, provider, model, syste
 func (s *SQLiteStore) UpdateAgentRun(run *models.AgentRun) error {
 	run.UpdatedAt = time.Now()
 	_, err := s.db.Exec(
-		`UPDATE agent_runs SET status = ?, final_result = ?, error = ?, step_count = ?, updated_at = ? WHERE id = ?`,
-		run.Status, run.FinalResult, run.Error, run.StepCount, run.UpdatedAt, run.ID,
+		`UPDATE agent_runs SET status = ?, final_result = ?, error = ?, paused_messages = ?, step_count = ?, updated_at = ? WHERE id = ?`,
+		run.Status, run.FinalResult, run.Error, run.PausedMessages, run.StepCount, run.UpdatedAt, run.ID,
 	)
 	return err
 }
 
-const agentRunCols = `id, task_id, project_id, project_uuid, phase, provider, model, status, final_result, error, system_prompt, repo_snapshot, step_count, created_at, updated_at`
+const agentRunCols = `id, task_id, project_id, project_uuid, phase, provider, model, status, final_result, error, system_prompt, repo_snapshot, paused_messages, step_count, created_at, updated_at`
 
 func scanAgentRun(row interface{ Scan(...interface{}) error }) (*models.AgentRun, error) {
 	r := &models.AgentRun{}
 	err := row.Scan(&r.ID, &r.TaskID, &r.ProjectID, &r.ProjectUUID, &r.Phase, &r.Provider, &r.Model, &r.Status,
-		&r.FinalResult, &r.Error, &r.SystemPrompt, &r.RepoSnapshot, &r.StepCount, &r.CreatedAt, &r.UpdatedAt)
+		&r.FinalResult, &r.Error, &r.SystemPrompt, &r.RepoSnapshot, &r.PausedMessages, &r.StepCount, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -853,4 +924,250 @@ func (s *SQLiteStore) ListAgentSteps(runID int64) ([]models.AgentStep, error) {
 		steps = append(steps, st)
 	}
 	return steps, nil
+}
+
+// --- Agent Questions ---
+
+func (s *SQLiteStore) CreateAgentQuestion(runID, taskID int64, question string, options []string) (*models.AgentQuestion, error) {
+	now := time.Now()
+	optJSON, _ := json.Marshal(options)
+	res, err := s.db.Exec(
+		"INSERT INTO agent_questions (run_id, task_id, question, options, created_at) VALUES (?, ?, ?, ?, ?)",
+		runID, taskID, question, string(optJSON), now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &models.AgentQuestion{
+		ID: id, RunID: runID, TaskID: taskID,
+		Question: question, Options: options, CreatedAt: now,
+	}, nil
+}
+
+func (s *SQLiteStore) AnswerAgentQuestion(id int64, answer string) error {
+	_, err := s.db.Exec("UPDATE agent_questions SET answer = ?, answered = 1 WHERE id = ?", answer, id)
+	return err
+}
+
+func (s *SQLiteStore) ListAgentQuestions(runID int64) ([]models.AgentQuestion, error) {
+	rows, err := s.db.Query(
+		"SELECT id, run_id, task_id, question, options, answer, answered, created_at FROM agent_questions WHERE run_id = ? ORDER BY id",
+		runID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var qs []models.AgentQuestion
+	for rows.Next() {
+		var q models.AgentQuestion
+		var optJSON string
+		var answered int
+		if err := rows.Scan(&q.ID, &q.RunID, &q.TaskID, &q.Question, &optJSON, &q.Answer, &answered, &q.CreatedAt); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(optJSON), &q.Options)
+		q.Answered = answered != 0
+		qs = append(qs, q)
+	}
+	return qs, nil
+}
+
+func (s *SQLiteStore) ListPendingQuestions(taskID int64) ([]models.AgentQuestion, error) {
+	rows, err := s.db.Query(
+		`SELECT q.id, q.run_id, q.task_id, q.question, q.options, q.answer, q.answered, q.created_at
+		 FROM agent_questions q
+		 JOIN agent_runs r ON q.run_id = r.id
+		 WHERE q.task_id = ? AND r.status = 'waiting' AND q.answered = 0
+		 ORDER BY q.id`, taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var qs []models.AgentQuestion
+	for rows.Next() {
+		var q models.AgentQuestion
+		var optJSON string
+		var answered int
+		if err := rows.Scan(&q.ID, &q.RunID, &q.TaskID, &q.Question, &optJSON, &q.Answer, &answered, &q.CreatedAt); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(optJSON), &q.Options)
+		q.Answered = answered != 0
+		qs = append(qs, q)
+	}
+	return qs, nil
+}
+
+// --- Exclude Rules (global) ---
+
+func (s *SQLiteStore) ListExcludeRules() ([]models.ExcludeRule, error) {
+	rows, err := s.db.Query("SELECT id, pattern, enabled_by_default, created_at FROM exclude_rules ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var rules []models.ExcludeRule
+	for rows.Next() {
+		var r models.ExcludeRule
+		var enabled int
+		if err := rows.Scan(&r.ID, &r.Pattern, &enabled, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		r.EnabledByDefault = enabled != 0
+		rules = append(rules, r)
+	}
+	return rules, nil
+}
+
+func (s *SQLiteStore) CreateExcludeRule(pattern string, enabledByDefault bool) (*models.ExcludeRule, error) {
+	now := time.Now()
+	e := 0
+	if enabledByDefault {
+		e = 1
+	}
+	res, err := s.db.Exec("INSERT INTO exclude_rules (pattern, enabled_by_default, created_at) VALUES (?, ?, ?)", pattern, e, now)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &models.ExcludeRule{ID: id, Pattern: pattern, EnabledByDefault: enabledByDefault, CreatedAt: now}, nil
+}
+
+func (s *SQLiteStore) UpdateExcludeRule(id int64, pattern string, enabledByDefault bool) error {
+	e := 0
+	if enabledByDefault {
+		e = 1
+	}
+	_, err := s.db.Exec("UPDATE exclude_rules SET pattern = ?, enabled_by_default = ? WHERE id = ?", pattern, e, id)
+	return err
+}
+
+func (s *SQLiteStore) DeleteExcludeRule(id int64) error {
+	_, err := s.db.Exec("DELETE FROM exclude_rules WHERE id = ?", id)
+	return err
+}
+
+// --- Project Exclude Overrides ---
+
+func (s *SQLiteStore) SetProjectExcludeOverride(projectID, ruleID int64, enabled bool) error {
+	e := 0
+	if enabled {
+		e = 1
+	}
+	_, err := s.db.Exec(
+		"INSERT INTO project_exclude_overrides (project_id, rule_id, enabled) VALUES (?, ?, ?) ON CONFLICT(project_id, rule_id) DO UPDATE SET enabled = ?",
+		projectID, ruleID, e, e,
+	)
+	return err
+}
+
+func (s *SQLiteStore) DeleteProjectExcludeOverride(projectID, ruleID int64) error {
+	_, err := s.db.Exec("DELETE FROM project_exclude_overrides WHERE project_id = ? AND rule_id = ?", projectID, ruleID)
+	return err
+}
+
+func (s *SQLiteStore) ListProjectExcludeOverrides(projectID int64) ([]models.ProjectExcludeOverride, error) {
+	rows, err := s.db.Query("SELECT id, project_id, rule_id, enabled FROM project_exclude_overrides WHERE project_id = ?", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var overrides []models.ProjectExcludeOverride
+	for rows.Next() {
+		var o models.ProjectExcludeOverride
+		var enabled int
+		if err := rows.Scan(&o.ID, &o.ProjectID, &o.RuleID, &enabled); err != nil {
+			return nil, err
+		}
+		o.Enabled = enabled != 0
+		overrides = append(overrides, o)
+	}
+	return overrides, nil
+}
+
+// --- Project Custom Patterns ---
+
+func (s *SQLiteStore) ListProjectCustomPatterns(projectID int64) ([]models.ProjectCustomPattern, error) {
+	rows, err := s.db.Query("SELECT id, project_id, pattern, created_at FROM project_custom_patterns WHERE project_id = ? ORDER BY id", projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var patterns []models.ProjectCustomPattern
+	for rows.Next() {
+		var p models.ProjectCustomPattern
+		if err := rows.Scan(&p.ID, &p.ProjectID, &p.Pattern, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		patterns = append(patterns, p)
+	}
+	return patterns, nil
+}
+
+func (s *SQLiteStore) AddProjectCustomPattern(projectID int64, pattern string) (*models.ProjectCustomPattern, error) {
+	now := time.Now()
+	res, err := s.db.Exec("INSERT INTO project_custom_patterns (project_id, pattern, created_at) VALUES (?, ?, ?)", projectID, pattern, now)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &models.ProjectCustomPattern{ID: id, ProjectID: projectID, Pattern: pattern, CreatedAt: now}, nil
+}
+
+func (s *SQLiteStore) DeleteProjectCustomPattern(id int64) error {
+	_, err := s.db.Exec("DELETE FROM project_custom_patterns WHERE id = ?", id)
+	return err
+}
+
+// GetEffectiveExcludePatterns returns all enabled patterns for a project:
+// global rules (with per-project overrides applied) + project custom patterns.
+func (s *SQLiteStore) GetEffectiveExcludePatterns(projectID int64) ([]string, error) {
+	rules, err := s.ListExcludeRules()
+	if err != nil {
+		return nil, err
+	}
+	overrides, err := s.ListProjectExcludeOverrides(projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	overrideMap := make(map[int64]bool)
+	for _, o := range overrides {
+		overrideMap[o.RuleID] = o.Enabled
+	}
+
+	seen := make(map[string]bool)
+	var result []string
+
+	for _, r := range rules {
+		enabled := r.EnabledByDefault
+		if ov, ok := overrideMap[r.ID]; ok {
+			enabled = ov
+		}
+		if enabled && !seen[r.Pattern] {
+			seen[r.Pattern] = true
+			result = append(result, r.Pattern)
+		}
+	}
+
+	custom, err := s.ListProjectCustomPatterns(projectID)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range custom {
+		if !seen[c.Pattern] {
+			seen[c.Pattern] = true
+			result = append(result, c.Pattern)
+		}
+	}
+
+	return result, nil
 }

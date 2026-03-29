@@ -60,9 +60,34 @@ type Store interface {
 	CreateAgentStep(runID int64, step *models.AgentStep) (*models.AgentStep, error)
 	ListAgentSteps(runID int64) ([]models.AgentStep, error)
 
+	// Agent Questions (pause/resume)
+	CreateAgentQuestion(runID, taskID int64, question string, options []string) (*models.AgentQuestion, error)
+	AnswerAgentQuestion(id int64, answer string) error
+	ListAgentQuestions(runID int64) ([]models.AgentQuestion, error)
+	ListPendingQuestions(taskID int64) ([]models.AgentQuestion, error)
+
 	// Settings
 	GetSetting(key string) (string, error)
 	SetSetting(key, value string) error
+
+	// Exclude Rules (global)
+	ListExcludeRules() ([]models.ExcludeRule, error)
+	CreateExcludeRule(pattern string, enabledByDefault bool) (*models.ExcludeRule, error)
+	UpdateExcludeRule(id int64, pattern string, enabledByDefault bool) error
+	DeleteExcludeRule(id int64) error
+
+	// Project exclude overrides
+	SetProjectExcludeOverride(projectID, ruleID int64, enabled bool) error
+	DeleteProjectExcludeOverride(projectID, ruleID int64) error
+	ListProjectExcludeOverrides(projectID int64) ([]models.ProjectExcludeOverride, error)
+
+	// Project custom patterns
+	ListProjectCustomPatterns(projectID int64) ([]models.ProjectCustomPattern, error)
+	AddProjectCustomPattern(projectID int64, pattern string) (*models.ProjectCustomPattern, error)
+	DeleteProjectCustomPattern(id int64) error
+
+	// Combined: effective patterns for a project (rules + overrides + custom)
+	GetEffectiveExcludePatterns(projectID int64) ([]string, error)
 
 	Close() error
 }

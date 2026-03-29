@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -108,6 +109,7 @@ func (s *Server) setupRoutes() {
 	api.Delete("/repos/:repoId", s.handleDeleteRepo)
 	api.Post("/projects/:id/scan-directory", s.handleScanDirectory)
 	api.Post("/discover-repos", s.handleDiscoverRepos)
+	api.Post("/analyze-folder", s.handleAnalyzeFolder)
 
 	// Tasks
 	api.Get("/projects/:id/tasks", s.handleListTasks)
@@ -123,7 +125,9 @@ func (s *Server) setupRoutes() {
 	// Agent actions
 	api.Post("/tasks/:taskId/plan", s.handlePlan)
 	api.Post("/tasks/:taskId/plan/chat", s.handlePlanChat)
+	api.Post("/tasks/:taskId/plan/answer", s.handlePlanAnswer)
 	api.Get("/tasks/:taskId/plan/messages", s.handleListPlanMessages)
+	api.Get("/tasks/:taskId/questions", s.handleGetPendingQuestions)
 	api.Post("/tasks/:taskId/execute", s.handleExecute)
 
 	// Chat sessions
@@ -144,6 +148,19 @@ func (s *Server) setupRoutes() {
 
 	// Providers
 	api.Get("/providers", s.handleListProviders)
+
+	// Exclude Rules (global settings)
+	api.Get("/exclude-rules", s.handleListExcludeRules)
+	api.Post("/exclude-rules", s.handleCreateExcludeRule)
+	api.Put("/exclude-rules/:id", s.handleUpdateExcludeRule)
+	api.Delete("/exclude-rules/:id", s.handleDeleteExcludeRule)
+
+	// Project exclude config
+	api.Get("/projects/:id/exclude-config", s.handleGetProjectExcludeConfig)
+	api.Post("/projects/:id/exclude-override", s.handleSetProjectExcludeOverride)
+	api.Delete("/projects/:id/exclude-override", s.handleDeleteProjectExcludeOverride)
+	api.Post("/projects/:id/custom-patterns", s.handleAddProjectCustomPattern)
+	api.Delete("/custom-patterns/:patternId", s.handleDeleteProjectCustomPattern)
 
 	// System / Utilities
 	api.Post("/pick-directory", s.handlePickDirectory)
@@ -230,6 +247,14 @@ func getMimeType(path string) string {
 // Helper functions
 
 func writeJSON(c fiber.Ctx, status int, v interface{}) error {
+	if v == nil {
+		return c.Status(status).JSON([]interface{}{})
+	}
+	// Go nil slices serialize as JSON null — use reflect to catch and return []
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Slice && rv.IsNil() {
+		return c.Status(status).JSON([]interface{}{})
+	}
 	return c.Status(status).JSON(v)
 }
 

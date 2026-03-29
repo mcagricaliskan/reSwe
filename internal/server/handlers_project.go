@@ -92,13 +92,19 @@ func (s *Server) handleAddRepo(c fiber.Ctx) error {
 		return writeError(c, 400, "path is required")
 	}
 
+	// Verify path exists and is a directory
+	info, err := os.Stat(req.Path)
+	if err != nil || !info.IsDir() {
+		return writeError(c, 400, "path does not exist or is not a directory")
+	}
+
 	name := filepath.Base(req.Path)
 	remoteURL := ""
 	headRef := ""
 	if scanner.IsGitRepo(req.Path) {
-		info := scanner.BuildRepoInfo(req.Path)
-		remoteURL = info.RemoteURL
-		headRef = info.HeadRef
+		repoInfo := scanner.BuildRepoInfo(req.Path)
+		remoteURL = repoInfo.RemoteURL
+		headRef = repoInfo.HeadRef
 	}
 	identifier := scanner.GetRepoIdentifier(req.Path)
 
@@ -116,6 +122,25 @@ func (s *Server) handleAddRepo(c fiber.Ctx) error {
 	})
 
 	return writeJSON(c, 201, repo)
+}
+
+func (s *Server) handleAnalyzeFolder(c fiber.Ctx) error {
+	var req struct {
+		Path string `json:"path"`
+	}
+	if err := c.Bind().JSON(&req); err != nil {
+		return writeError(c, 400, "invalid request body")
+	}
+	if req.Path == "" {
+		return writeError(c, 400, "path is required")
+	}
+
+	analysis, err := s.scanner.AnalyzeFolder(req.Path)
+	if err != nil {
+		return writeError(c, 400, err.Error())
+	}
+
+	return writeJSON(c, 200, analysis)
 }
 
 func (s *Server) handleListRepos(c fiber.Ctx) error {
