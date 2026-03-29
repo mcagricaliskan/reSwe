@@ -27,6 +27,91 @@ export interface ChatMessage {
   created_at: string
 }
 
+function truncateArg(arg: string, max = 50): string {
+  if (!arg) return ''
+  const oneline = arg.replace(/\n/g, ' ').trim()
+  return oneline.length > max ? oneline.slice(0, max) + '...' : oneline
+}
+
+function CollapsibleStepMessage({ step, index }: { step: AgentStep; index: number }) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (step.is_final) {
+    return (
+      <div key={`agent-step-${index}`} className="flex justify-start">
+        <div className="max-w-[90%] rounded-lg text-sm bg-card border overflow-hidden">
+          <button onClick={() => setExpanded(e => !e)} className="flex items-center gap-2 w-full text-left px-3 py-1.5 hover:bg-accent/30 transition-colors text-xs">
+            {expanded ? <ChevronDown className="h-3 w-3 text-emerald-400 shrink-0" /> : <ChevronRight className="h-3 w-3 text-emerald-400 shrink-0" />}
+            <CheckCircle2 className="h-3 w-3 text-emerald-400 shrink-0" />
+            <span className="text-emerald-400 font-medium">Plan complete</span>
+            {step.duration_ms != null && step.duration_ms > 0 && (
+              <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5">
+                <Timer className="h-2.5 w-2.5" />{formatElapsed(step.duration_ms)}
+              </span>
+            )}
+          </button>
+          {expanded && step.action_arg && (
+            <div className="px-3 pb-2 border-t">
+              <div className="prose prose-sm max-w-none dark:prose-invert mt-2">
+                <ReactMarkdown>{step.action_arg}</ReactMarkdown>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div key={`agent-step-${index}`} className="flex justify-start">
+      <div className="max-w-[90%] rounded-lg text-sm bg-card border overflow-hidden">
+        <button onClick={() => setExpanded(e => !e)} className="flex items-center gap-2 w-full text-left px-3 py-1.5 hover:bg-accent/30 transition-colors text-xs">
+          {expanded ? <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" /> : <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
+          <span className="text-[10px] font-bold text-muted-foreground bg-secondary px-1 py-0.5 rounded">{step.step}</span>
+          {step.action ? (
+            <span className="text-blue-400 font-mono truncate min-w-0">
+              {step.action}(<span className="text-foreground/40">{truncateArg(step.action_arg)}</span>)
+            </span>
+          ) : (
+            <span className="text-muted-foreground italic">thinking...</span>
+          )}
+          {step.duration_ms != null && step.duration_ms > 0 && (
+            <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5 shrink-0">
+              <Timer className="h-2.5 w-2.5" />{formatElapsed(step.duration_ms)}
+            </span>
+          )}
+        </button>
+        {expanded && (
+          <div className="px-3 pb-2 border-t space-y-1.5 pt-1.5">
+            {step.think && (
+              <div className="flex gap-2 pl-2 border-l-2 border-violet-500/30">
+                <Brain className="h-3 w-3 text-violet-400 shrink-0 mt-0.5" />
+                <p className="text-xs text-foreground/80">{step.think}</p>
+              </div>
+            )}
+            {step.action && (
+              <div className="flex gap-2 pl-2 border-l-2 border-blue-500/30">
+                <Wrench className="h-3 w-3 text-blue-400 shrink-0 mt-0.5" />
+                <code className="text-[11px] font-mono text-blue-300 break-all whitespace-pre-wrap">
+                  {step.action}({step.action_arg})
+                </code>
+              </div>
+            )}
+            {step.observation && (
+              <div className="flex gap-2 pl-2 border-l-2 border-amber-500/30">
+                <Eye className="h-3 w-3 text-amber-400 shrink-0 mt-0.5" />
+                <pre className="text-[11px] text-foreground/60 whitespace-pre-wrap bg-secondary/50 rounded p-1.5 overflow-auto max-h-48 flex-1 min-w-0">
+                  {step.observation}
+                </pre>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 interface ChatPanelProps {
   messages: ChatMessage[]
   agentSteps: AgentStep[]
@@ -75,7 +160,13 @@ export function ChatPanel({
   const elapsedLabel = activePhase ? formatElapsed(elapsedMs) : null
 
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // Scroll only within the chat's own scroll container, not the whole page
+    const el = chatEndRef.current
+    if (!el) return
+    const scrollParent = el.closest('[data-radix-scroll-area-viewport]') || el.parentElement
+    if (scrollParent) {
+      scrollParent.scrollTop = scrollParent.scrollHeight
+    }
   }, [messages, agentSteps.length, activePhase])
 
   function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
@@ -142,91 +233,6 @@ export function ChatPanel({
       if (e.key === 'Escape') { e.preventDefault(); mention.deactivate(); return }
     }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend() }
-  }
-
-  function truncateArg(arg: string, max = 50): string {
-    if (!arg) return ''
-    const oneline = arg.replace(/\n/g, ' ').trim()
-    return oneline.length > max ? oneline.slice(0, max) + '...' : oneline
-  }
-
-  function CollapsibleStepMessage({ step, index }: { step: AgentStep; index: number }) {
-    const [expanded, setExpanded] = useState(false)
-
-    if (step.is_final) {
-      return (
-        <div key={`agent-step-${index}`} className="flex justify-start">
-          <div className="max-w-[90%] rounded-lg text-sm bg-card border overflow-hidden">
-            <button onClick={() => setExpanded(e => !e)} className="flex items-center gap-2 w-full text-left px-3 py-1.5 hover:bg-accent/30 transition-colors text-xs">
-              {expanded ? <ChevronDown className="h-3 w-3 text-emerald-400 shrink-0" /> : <ChevronRight className="h-3 w-3 text-emerald-400 shrink-0" />}
-              <CheckCircle2 className="h-3 w-3 text-emerald-400 shrink-0" />
-              <span className="text-emerald-400 font-medium">Plan complete</span>
-              {step.duration_ms != null && step.duration_ms > 0 && (
-                <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5">
-                  <Timer className="h-2.5 w-2.5" />{formatElapsed(step.duration_ms)}
-                </span>
-              )}
-            </button>
-            {expanded && step.action_arg && (
-              <div className="px-3 pb-2 border-t">
-                <div className="prose prose-sm max-w-none dark:prose-invert mt-2">
-                  <ReactMarkdown>{step.action_arg}</ReactMarkdown>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )
-    }
-
-    return (
-      <div key={`agent-step-${index}`} className="flex justify-start">
-        <div className="max-w-[90%] rounded-lg text-sm bg-card border overflow-hidden">
-          <button onClick={() => setExpanded(e => !e)} className="flex items-center gap-2 w-full text-left px-3 py-1.5 hover:bg-accent/30 transition-colors text-xs">
-            {expanded ? <ChevronDown className="h-3 w-3 text-muted-foreground shrink-0" /> : <ChevronRight className="h-3 w-3 text-muted-foreground shrink-0" />}
-            <span className="text-[10px] font-bold text-muted-foreground bg-secondary px-1 py-0.5 rounded">{step.step}</span>
-            {step.action ? (
-              <span className="text-blue-400 font-mono truncate min-w-0">
-                {step.action}(<span className="text-foreground/40">{truncateArg(step.action_arg)}</span>)
-              </span>
-            ) : (
-              <span className="text-muted-foreground italic">thinking...</span>
-            )}
-            {step.duration_ms != null && step.duration_ms > 0 && (
-              <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5 shrink-0">
-                <Timer className="h-2.5 w-2.5" />{formatElapsed(step.duration_ms)}
-              </span>
-            )}
-          </button>
-          {expanded && (
-            <div className="px-3 pb-2 border-t space-y-1.5 pt-1.5">
-              {step.think && (
-                <div className="flex gap-2 pl-2 border-l-2 border-violet-500/30">
-                  <Brain className="h-3 w-3 text-violet-400 shrink-0 mt-0.5" />
-                  <p className="text-xs text-foreground/80">{step.think}</p>
-                </div>
-              )}
-              {step.action && (
-                <div className="flex gap-2 pl-2 border-l-2 border-blue-500/30">
-                  <Wrench className="h-3 w-3 text-blue-400 shrink-0 mt-0.5" />
-                  <code className="text-[11px] font-mono text-blue-300 break-all whitespace-pre-wrap">
-                    {step.action}({step.action_arg})
-                  </code>
-                </div>
-              )}
-              {step.observation && (
-                <div className="flex gap-2 pl-2 border-l-2 border-amber-500/30">
-                  <Eye className="h-3 w-3 text-amber-400 shrink-0 mt-0.5" />
-                  <pre className="text-[11px] text-foreground/60 whitespace-pre-wrap bg-secondary/50 rounded p-1.5 overflow-auto max-h-48 flex-1 min-w-0">
-                    {step.observation}
-                  </pre>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-    )
   }
 
   return (

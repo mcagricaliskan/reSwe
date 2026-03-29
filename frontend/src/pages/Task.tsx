@@ -261,7 +261,7 @@ export default function TaskPage() {
       <div className="flex-1 min-h-0 flex gap-0 border rounded-lg overflow-hidden">
         {/* Plan panel (left) — shown when plan exists or planning is active */}
         {showPlanPanel && (
-          <div className="flex-1 min-w-0 flex flex-col border-r">
+          <div className="flex-1 min-w-0 flex flex-col border-r overflow-hidden">
             <div className="shrink-0 px-4 py-2 border-b bg-card flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <FileText className="h-3.5 w-3.5 text-muted-foreground" />
@@ -301,7 +301,7 @@ export default function TaskPage() {
         )}
 
         {/* Chat panel (right, or full width if no plan) */}
-        <div className={`${showPlanPanel ? 'w-[375px] lg:w-[425px] shrink-0' : 'flex-1'} flex flex-col bg-background`}>
+        <div className={`${showPlanPanel ? 'w-[375px] lg:w-[425px] shrink-0' : 'flex-1'} flex flex-col bg-background overflow-hidden`}>
           {showPlanPanel && (
             <div className="shrink-0 px-3 py-1.5 border-b bg-card">
               <span className="text-xs font-medium text-muted-foreground">Chat</span>

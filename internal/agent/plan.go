@@ -31,9 +31,19 @@ Description: %s
 Explore the codebase and create an implementation plan. If anything is unclear, ask me.`, task.Title, task.Description, extra.String())
 
 	if len(history) > 0 {
-		taskContext = ""
-		if userMessage != "" {
-			history = append(history, models.ChatMessage{Role: "user", Content: userMessage})
+		// Follow-up: agent has conversation history
+		if task.ImplementationPlan != "" && userMessage != "" {
+			// Edit mode: pass current plan + user's change request
+			taskContext = fmt.Sprintf(
+				"## Current Plan\n%s\n\n## User Request\n%s\n\n"+
+					"Update the plan based on the user's request. "+
+					"Return the COMPLETE updated plan (all sections, not just changes). "+
+					"If the change affects TODOs, update the ---TODOS--- block too.",
+				task.ImplementationPlan, userMessage)
+		} else if userMessage != "" {
+			taskContext = userMessage
+		} else {
+			taskContext = ""
 		}
 	} else if userMessage != "" {
 		taskContext += fmt.Sprintf("\n\n## Additional User Instructions\n%s", userMessage)

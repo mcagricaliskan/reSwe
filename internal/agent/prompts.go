@@ -93,7 +93,17 @@ TODO rules:
 - Description must include: which file, what change, enough detail to execute without re-reading
 - JSON must be valid (double quotes, no trailing commas)
 
-IMPORTANT: done ARG = clean plan + ---TODOS--- block. No thinking text. No "I" language.`,
+IMPORTANT: done ARG = clean plan + ---TODOS--- block. No thinking text. No "I" language.
+
+## Editing an Existing Plan
+
+If you receive a "Current Plan" and "User Request", you are EDITING an existing plan, not creating from scratch.
+- Read the current plan carefully
+- Apply ONLY the changes the user requested
+- Keep all unaffected sections exactly as they are
+- If you need to verify something, use tools (read_file, search_code)
+- Return the COMPLETE updated plan — all sections including unchanged ones
+- Update the ---TODOS--- block if the change affects implementation steps`,
 
 	"execute-todo": `You are executing ONE specific step of an implementation plan.
 Focus ONLY on this step. Don't do other steps.
