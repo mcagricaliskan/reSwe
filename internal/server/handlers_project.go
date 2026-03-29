@@ -350,9 +350,13 @@ func (s *Server) handleSearchProjectFiles(c fiber.Ctx) error {
 		return writeError(c, 400, "invalid project id")
 	}
 	q := c.Query("q", "")
-	if q == "" {
-		return writeJSON(c, 200, []any{})
+
+	// Lazy sync: if no files indexed yet, scan repos now
+	probe, _ := s.store.SearchProjectFiles(projectID, "", 1)
+	if len(probe) == 0 {
+		s.syncProjectFilesForProject(projectID)
 	}
+
 	files, err := s.store.SearchProjectFiles(projectID, q, 20)
 	if err != nil {
 		return writeError(c, 500, err.Error())
@@ -363,18 +367,23 @@ func (s *Server) handleSearchProjectFiles(c fiber.Ctx) error {
 	return writeJSON(c, 200, files)
 }
 
-func (s *Server) handleSyncProjectFiles(c fiber.Ctx) error {
-	projectID, err := strconv.ParseInt(c.Params("id"), 10, 64)
-	if err != nil {
-		return writeError(c, 400, "invalid project id")
-	}
+func (s *Server) syncProjectFilesForProject(projectID int64) int {
 	repos, err := s.store.ListRepos(projectID)
 	if err != nil {
-		return writeError(c, 500, err.Error())
+		return 0
 	}
 
 	var allFiles []models.ProjectFile
 	for _, repo := range repos {
+		// Add the repo root itself so users can find it by name
+		allFiles = append(allFiles, models.ProjectFile{
+			ProjectID: projectID,
+			RepoID:    repo.ID,
+			RelPath:   repo.Name,
+			Size:      0,
+			IsDir:     true,
+		})
+
 		files, err := s.scanner.ScanTree(repo.Path)
 		if err != nil {
 			continue
@@ -383,15 +392,22 @@ func (s *Server) handleSyncProjectFiles(c fiber.Ctx) error {
 			allFiles = append(allFiles, models.ProjectFile{
 				ProjectID: projectID,
 				RepoID:    repo.ID,
-				RelPath:   f.RelPath,
+				RelPath:   repo.Name + "/" + f.RelPath,
 				Size:      f.Size,
 				IsDir:     f.IsDir,
 			})
 		}
 	}
 
-	if err := s.store.SyncProjectFiles(projectID, allFiles); err != nil {
-		return writeError(c, 500, err.Error())
+	s.store.SyncProjectFiles(projectID, allFiles)
+	return len(allFiles)
+}
+
+func (s *Server) handleSyncProjectFiles(c fiber.Ctx) error {
+	projectID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid project id")
 	}
-	return writeJSON(c, 200, fiber.Map{"count": len(allFiles)})
+	count := s.syncProjectFilesForProject(projectID)
+	return writeJSON(c, 200, fiber.Map{"count": count})
 }

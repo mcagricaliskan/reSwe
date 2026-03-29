@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cagri/reswe/internal/models"
 	"github.com/cagri/reswe/internal/provider"
@@ -82,7 +83,7 @@ func (o *Orchestrator) getTaskWithRepos(taskID int64) (*models.Task, []models.Re
 // makeStepCallback creates callbacks that emit structured steps + raw stream to WebSocket AND persist to DB
 func (o *Orchestrator) makeStepCallback(taskID int64, phase string, run *AgentRun, dbRun *models.AgentRun) (StepCallback, provider.StreamCallback) {
 	onStep := func(step Step) {
-		// Persist step to DB
+		// Persist step to DB with timing
 		dbStep := &models.AgentStep{
 			StepNumber:  step.Number,
 			Think:       step.Think,
@@ -90,6 +91,9 @@ func (o *Orchestrator) makeStepCallback(taskID int64, phase string, run *AgentRu
 			ActionArg:   step.ActionArg,
 			Observation: step.Observation,
 			IsFinal:     step.IsFinal,
+			StartedAt:   step.StartedAt,
+			CompletedAt: step.CompletedAt,
+			DurationMs:  step.DurationMs,
 		}
 		o.store.CreateAgentStep(dbRun.ID, dbStep)
 
@@ -97,16 +101,19 @@ func (o *Orchestrator) makeStepCallback(taskID int64, phase string, run *AgentRu
 		dbRun.StepCount = step.Number
 		o.store.UpdateAgentRun(dbRun)
 
-		// Emit to WebSocket
+		// Emit to WebSocket with timing
 		o.emit(taskID, models.WSTypeAgentStep, map[string]interface{}{
-			"phase":       phase,
-			"run_id":      dbRun.ID,
-			"step":        step.Number,
-			"think":       step.Think,
-			"action":      step.Action,
-			"action_arg":  step.ActionArg,
-			"observation": step.Observation,
-			"is_final":    step.IsFinal,
+			"phase":        phase,
+			"run_id":       dbRun.ID,
+			"step":         step.Number,
+			"think":        step.Think,
+			"action":       step.Action,
+			"action_arg":   step.ActionArg,
+			"observation":  step.Observation,
+			"is_final":     step.IsFinal,
+			"started_at":   step.StartedAt,
+			"completed_at": step.CompletedAt,
+			"duration_ms":  step.DurationMs,
 		})
 	}
 
@@ -121,8 +128,11 @@ func (o *Orchestrator) makeStepCallback(taskID int64, phase string, run *AgentRu
 	return onStep, onStream
 }
 
-// completeRun finalizes a DB run record
+// completeRun finalizes a DB run record with timing
 func (o *Orchestrator) completeRun(dbRun *models.AgentRun, result string, err error) {
+	now := time.Now()
+	dbRun.CompletedAt = &now
+	dbRun.DurationMs = now.Sub(dbRun.StartedAt).Milliseconds()
 	if err != nil {
 		dbRun.Status = "error"
 		dbRun.Error = err.Error()
@@ -156,6 +166,15 @@ func (o *Orchestrator) PreviewPrompt(taskID int64, phase string) (*PromptPreview
 func (o *Orchestrator) syncProjectFiles(projectID int64, repos []models.Repo) {
 	var allFiles []models.ProjectFile
 	for _, repo := range repos {
+		// Add the repo root itself so users can find it by name
+		allFiles = append(allFiles, models.ProjectFile{
+			ProjectID: projectID,
+			RepoID:    repo.ID,
+			RelPath:   repo.Name,
+			Size:      0,
+			IsDir:     true,
+		})
+
 		files, err := o.scanner.ScanTree(repo.Path)
 		if err != nil {
 			continue
@@ -164,7 +183,7 @@ func (o *Orchestrator) syncProjectFiles(projectID int64, repos []models.Repo) {
 			allFiles = append(allFiles, models.ProjectFile{
 				ProjectID: projectID,
 				RepoID:    repo.ID,
-				RelPath:   f.RelPath,
+				RelPath:   repo.Name + "/" + f.RelPath,
 				Size:      f.Size,
 				IsDir:     f.IsDir,
 			})
@@ -198,9 +217,9 @@ func (o *Orchestrator) initRun(taskID int64, phase string, cfg RunConfig) (*mode
 	return task, repos, p, tools, sysPrompt, nil
 }
 
-// loadHistory loads the persisted plan conversation as ChatMessages
+// loadHistory loads the persisted task conversation as ChatMessages (unified for all phases)
 func (o *Orchestrator) loadHistory(taskID int64) []models.ChatMessage {
-	msgs, err := o.store.ListPlanMessages(taskID)
+	msgs, err := o.store.ListTaskMessages(taskID)
 	if err != nil {
 		return nil
 	}
@@ -211,13 +230,13 @@ func (o *Orchestrator) loadHistory(taskID int64) []models.ChatMessage {
 	return history
 }
 
-// saveTurn saves both the user message and agent response to conversation history
+// saveTurn saves both the user message and agent response to task conversation history
 func (o *Orchestrator) saveTurn(taskID int64, userMsg, agentMsg string) {
 	if userMsg != "" {
-		o.store.AddPlanMessage(taskID, "user", userMsg)
+		o.store.AddTaskMessage(taskID, "user", userMsg)
 	}
 	if agentMsg != "" {
-		o.store.AddPlanMessage(taskID, "assistant", agentMsg)
+		o.store.AddTaskMessage(taskID, "assistant", agentMsg)
 	}
 }
 
@@ -229,12 +248,26 @@ func (o *Orchestrator) handleLoopResult(taskID int64, result LoopResult, dbRun *
 		o.completeRun(dbRun, result.FinalResult, nil)
 
 		if phase == "plan" {
-			task.ImplementationPlan = result.FinalResult
+			// Parse TODOs from plan result
+			desc, todos := parsePlanTodos(result.FinalResult)
+			if len(todos) > 0 {
+				o.store.ClearPlanTodos(taskID)
+				for i := range todos {
+					todos[i].TaskID = taskID
+					todos[i].RunID = dbRun.ID
+					o.store.CreatePlanTodo(&todos[i])
+				}
+				task.ImplementationPlan = desc
+			} else {
+				task.ImplementationPlan = result.FinalResult
+			}
 			task.Status = models.TaskStatusOpen
-		} else if phase == "execute" {
+			o.store.UpdateTask(task)
+		} else if phase == "execute" || phase == "execute-todo" {
 			task.Status = models.TaskStatusReview
+			o.store.UpdateTask(task)
 		}
-		o.store.UpdateTask(task)
+		// chat phase: no task status change
 		o.emit(taskID, models.WSTypeAgentDone, map[string]interface{}{"phase": phase, "run_id": dbRun.ID})
 		return nil
 
@@ -258,8 +291,10 @@ func (o *Orchestrator) handleLoopResult(taskID int64, result LoopResult, dbRun *
 			qIDs = append(qIDs, aq.ID)
 		}
 
-		task.Status = models.TaskStatusOpen
-		o.store.UpdateTask(task)
+		if phase != "chat" {
+			task.Status = models.TaskStatusOpen
+			o.store.UpdateTask(task)
+		}
 
 		// Emit to frontend
 		o.emit(taskID, models.WSTypeAgentWaiting, map[string]interface{}{
@@ -283,14 +318,12 @@ func (o *Orchestrator) handleLoopResult(taskID int64, result LoopResult, dbRun *
 	}
 }
 
-// Plan starts a new planning conversation
+// Plan starts a new planning run (uses task_messages for unified history)
 func (o *Orchestrator) Plan(taskID int64, cfg RunConfig) error {
 	task, _, p, tools, sysPrompt, err := o.initRun(taskID, "plan", cfg)
 	if err != nil {
 		return err
 	}
-
-	o.store.ClearPlanMessages(taskID)
 
 	ctx, memRun := o.Tracker.Start(taskID, "plan", cfg.Provider, cfg.Model)
 	dbRun, err := o.store.CreateAgentRun(taskID, "plan", cfg.Provider, cfg.Model, sysPrompt)
@@ -305,7 +338,7 @@ func (o *Orchestrator) Plan(taskID int64, cfg RunConfig) error {
 	onStep, onStream := o.makeStepCallback(taskID, "plan", memRun, dbRun)
 
 	userMsg := BuildUserPrompt("plan", task, "")
-	result := runPlan(ctx, p, cfg.Model, task, tools, sysPrompt, nil, onStep, onStream)
+	result := runPlan(ctx, p, cfg.Model, task, tools, sysPrompt, nil, "", onStep, onStream)
 
 	// Save conversation turn if agent produced output
 	if result.FinalResult != "" {
@@ -336,10 +369,17 @@ func (o *Orchestrator) PlanChat(taskID int64, userMessage string, cfg RunConfig)
 
 	onStep, onStream := o.makeStepCallback(taskID, "plan", memRun, dbRun)
 
-	result := runPlan(ctx, p, cfg.Model, task, tools, sysPrompt, history, onStep, onStream)
+	result := runPlan(ctx, p, cfg.Model, task, tools, sysPrompt, history, userMessage, onStep, onStream)
 
 	if result.FinalResult != "" {
-		o.saveTurn(taskID, userMessage, result.FinalResult)
+		savedUserMessage := userMessage
+		if len(history) == 0 {
+			savedUserMessage = BuildUserPrompt("plan", task, "")
+			if userMessage != "" {
+				savedUserMessage += fmt.Sprintf("\n\n## Additional User Instructions\n%s", userMessage)
+			}
+		}
+		o.saveTurn(taskID, savedUserMessage, result.FinalResult)
 		task.ImplementationPlan = result.FinalResult
 	}
 
@@ -423,6 +463,34 @@ func (o *Orchestrator) ResumePlan(taskID int64, answers map[int64]string, cfg Ru
 	return o.handleLoopResult(taskID, result, newDbRun, task, "plan")
 }
 
+// Chat starts a general-purpose chat conversation
+func (o *Orchestrator) Chat(taskID int64, userMessage string, cfg RunConfig) error {
+	task, _, p, tools, sysPrompt, err := o.initRun(taskID, "chat", cfg)
+	if err != nil {
+		return err
+	}
+
+	history := o.loadHistory(taskID)
+
+	ctx, memRun := o.Tracker.Start(taskID, "chat", cfg.Provider, cfg.Model)
+	dbRun, err := o.store.CreateAgentRun(taskID, "chat", cfg.Provider, cfg.Model, sysPrompt)
+	if err != nil {
+		return err
+	}
+
+	o.emit(taskID, models.WSTypeTaskUpdate, map[string]interface{}{"status": task.Status, "phase": "chat", "run_id": dbRun.ID})
+
+	onStep, onStream := o.makeStepCallback(taskID, "chat", memRun, dbRun)
+
+	result := runChat(ctx, p, cfg.Model, task, tools, sysPrompt, history, userMessage, onStep, onStream)
+
+	if result.FinalResult != "" {
+		o.saveTurn(taskID, userMessage, result.FinalResult)
+	}
+
+	return o.handleLoopResult(taskID, result, dbRun, task, "chat")
+}
+
 // Execute runs the execution agent
 func (o *Orchestrator) Execute(taskID int64, cfg RunConfig) error {
 	task, _, p, tools, sysPrompt, err := o.initRun(taskID, "execute", cfg)
@@ -463,4 +531,177 @@ func (o *Orchestrator) Execute(taskID int64, cfg RunConfig) error {
 	o.store.UpdateExecution(exec)
 
 	return o.handleLoopResult(taskID, result, dbRun, task, "execute")
+}
+
+// parsePlanTodos splits a plan result into description + TODO list
+func parsePlanTodos(raw string) (string, []models.PlanTodo) {
+	parts := strings.SplitN(raw, "---TODOS---", 2)
+	desc := strings.TrimSpace(parts[0])
+	if len(parts) < 2 {
+		return desc, nil
+	}
+
+	todoJSON := strings.TrimSpace(parts[1])
+	// Clean up: sometimes the model wraps in ```json ... ```
+	todoJSON = strings.TrimPrefix(todoJSON, "```json")
+	todoJSON = strings.TrimPrefix(todoJSON, "```")
+	todoJSON = strings.TrimSuffix(todoJSON, "```")
+	todoJSON = strings.TrimSpace(todoJSON)
+
+	var input []struct {
+		Order       int    `json:"order"`
+		Title       string `json:"title"`
+		Description string `json:"description"`
+		DependsOn   []int  `json:"depends_on"`
+	}
+	if err := json.Unmarshal([]byte(todoJSON), &input); err != nil {
+		return desc, nil // parsing failed, return description only
+	}
+
+	var todos []models.PlanTodo
+	for _, t := range input {
+		deps := make([]int64, len(t.DependsOn))
+		for i, d := range t.DependsOn {
+			deps[i] = int64(d)
+		}
+		todos = append(todos, models.PlanTodo{
+			OrderIndex:  t.Order,
+			Title:       t.Title,
+			Description: t.Description,
+			DependsOn:   deps,
+			Status:      "pending",
+		})
+	}
+	return desc, todos
+}
+
+// ExecuteTodos runs TODO items one by one in dependency order
+func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
+	task, _, p, tools, _, err := o.initRun(taskID, "execute-todo", cfg)
+	if err != nil {
+		return err
+	}
+
+	todos, err := o.store.ListPlanTodos(taskID)
+	if err != nil || len(todos) == 0 {
+		return fmt.Errorf("no TODOs found for task %d", taskID)
+	}
+
+	task.Status = models.TaskStatusExecuting
+	o.store.UpdateTask(task)
+	o.emit(taskID, models.WSTypeTaskUpdate, map[string]interface{}{"status": task.Status})
+
+	sysPrompt := DefaultSystemPrompts["execute-todo"]
+
+	for {
+		// Find next executable TODO
+		next := findNextTodo(todos)
+		if next == nil {
+			break
+		}
+
+		// Mark in_progress
+		next.Status = "in_progress"
+		o.store.UpdatePlanTodo(next)
+		o.emit(taskID, models.WSTypeTodoUpdate, next)
+
+		// Create agent run for this TODO
+		ctx, memRun := o.Tracker.Start(taskID, "execute-todo", cfg.Provider, cfg.Model)
+		dbRun, err := o.store.CreateAgentRun(taskID, "execute-todo", cfg.Provider, cfg.Model, sysPrompt)
+		if err != nil {
+			next.Status = "failed"
+			next.Result = err.Error()
+			o.store.UpdatePlanTodo(next)
+			o.emit(taskID, models.WSTypeTodoUpdate, next)
+			break
+		}
+
+		onStep, onStream := o.makeStepCallback(taskID, "execute-todo", memRun, dbRun)
+
+		// Build context: this TODO + plan + previous results
+		prevResults := buildPreviousResults(todos)
+		result := runTodoExecution(ctx, p, cfg.Model, task, next, prevResults, tools, sysPrompt, onStep, onStream)
+
+		o.Tracker.Complete(taskID, result.Error)
+		o.completeRun(dbRun, result.FinalResult, result.Error)
+
+		if result.Status == "done" {
+			next.Status = "done"
+			next.Result = result.FinalResult
+		} else {
+			next.Status = "failed"
+			errMsg := "unknown error"
+			if result.Error != nil {
+				errMsg = result.Error.Error()
+			}
+			next.Result = errMsg
+			o.store.UpdatePlanTodo(next)
+			o.emit(taskID, models.WSTypeTodoUpdate, next)
+			o.emit(taskID, models.WSTypeAgentError, map[string]interface{}{"error": errMsg})
+			break
+		}
+
+		o.store.UpdatePlanTodo(next)
+		o.emit(taskID, models.WSTypeTodoUpdate, next)
+
+		// Refresh todos from DB to get latest statuses
+		todos, _ = o.store.ListPlanTodos(taskID)
+	}
+
+	// Check if all done
+	todos, _ = o.store.ListPlanTodos(taskID)
+	allDone := true
+	for _, t := range todos {
+		if t.Status != "done" {
+			allDone = false
+			break
+		}
+	}
+	if allDone {
+		task.Status = models.TaskStatusReview
+		o.store.UpdateTask(task)
+	} else {
+		task.Status = models.TaskStatusOpen
+		o.store.UpdateTask(task)
+	}
+	o.emit(taskID, models.WSTypeAgentDone, map[string]interface{}{"phase": "execute-todo"})
+	return nil
+}
+
+// findNextTodo returns the first pending TODO whose dependencies are all done
+func findNextTodo(todos []models.PlanTodo) *models.PlanTodo {
+	doneOrders := make(map[int64]bool)
+	for _, t := range todos {
+		if t.Status == "done" {
+			doneOrders[int64(t.OrderIndex)] = true
+		}
+	}
+
+	for i := range todos {
+		if todos[i].Status != "pending" {
+			continue
+		}
+		allDepsDone := true
+		for _, dep := range todos[i].DependsOn {
+			if !doneOrders[dep] {
+				allDepsDone = false
+				break
+			}
+		}
+		if allDepsDone {
+			return &todos[i]
+		}
+	}
+	return nil
+}
+
+// buildPreviousResults collects results from completed TODOs for context
+func buildPreviousResults(todos []models.PlanTodo) string {
+	var b strings.Builder
+	for _, t := range todos {
+		if t.Status == "done" && t.Result != "" {
+			b.WriteString(fmt.Sprintf("## Step %d: %s (completed)\n%s\n\n", t.OrderIndex, t.Title, t.Result))
+		}
+	}
+	return b.String()
 }

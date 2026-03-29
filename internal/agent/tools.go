@@ -74,14 +74,24 @@ func (ts *ToolSet) Available() []Tool {
 			Parameters:  "path: string (e.g. '.', 'my-service', 'my-service/src')",
 		},
 		{
+			Name:        "write_file",
+			Description: "Create a new file or completely overwrite an existing file. Use for new files or when most of the file changes.",
+			Parameters:  "FILE: string (repo-prefixed path), CONTENT: string (complete file content)",
+		},
+		{
+			Name:        "edit_file",
+			Description: "Replace a specific section of a file. The OLD content must exactly match text in the file (including indentation). Read the file first with read_file, then copy the exact text you want to replace. Include 3-5 lines of context to ensure a unique match.",
+			Parameters:  "FILE: string (repo-prefixed path), OLD: string (exact text to find), NEW: string (replacement text)",
+		},
+		{
 			Name:        "ask_user",
 			Description: "Ask the user a question. The agent loop will PAUSE until the user answers. Use this when: requirements are ambiguous, there are multiple valid approaches, something seems risky or against best practices, or you need a decision you can't make from code alone.",
 			Parameters:  "question: string (specific, actionable question)",
 		},
 		{
 			Name:        "done",
-			Description: "Signal that you have completed your task. Include your final output/conclusion.",
-			Parameters:  "result: string (your final output — analysis, plan, questions summary, or code changes)",
+			Description: "Finish and output your final result. The ARG is the DELIVERABLE — a clean document, not your thinking process. Write it as if handing a document to another engineer. No 'I', no 'Let me', no reasoning — just the content.",
+			Parameters:  "result: string (clean markdown document — your final deliverable)",
 		},
 	}
 }
@@ -92,11 +102,33 @@ func (ts *ToolSet) ToolDescriptionBlock() string {
 	b.WriteString("## Available Tools\n\n")
 	b.WriteString("You MUST use tools to explore the codebase. Do NOT guess about file contents or structure.\n")
 	b.WriteString("Call tools using this exact format:\n\n")
+	b.WriteString("### Single-argument tools (read_file, list_dir, search_code, ask_user, done)\n")
 	b.WriteString("```\n")
 	b.WriteString("THINK: <your reasoning about what to do next>\n")
 	b.WriteString("ACTION: <tool_name>\n")
 	b.WriteString("ARG: <argument>\n")
 	b.WriteString("```\n\n")
+	b.WriteString("### edit_file (modify part of a file)\n")
+	b.WriteString("```\n")
+	b.WriteString("THINK: <reasoning>\n")
+	b.WriteString("ACTION: edit_file\n")
+	b.WriteString("ARG:\n")
+	b.WriteString("FILE: repo-name/path/to/file.ext\n")
+	b.WriteString("OLD:\n")
+	b.WriteString("<exact text from the file to replace — must match uniquely>\n")
+	b.WriteString("NEW:\n")
+	b.WriteString("<replacement text>\n")
+	b.WriteString("```\n\n")
+	b.WriteString("### write_file (create or overwrite entire file)\n")
+	b.WriteString("```\n")
+	b.WriteString("THINK: <reasoning>\n")
+	b.WriteString("ACTION: write_file\n")
+	b.WriteString("ARG:\n")
+	b.WriteString("FILE: repo-name/path/to/file.ext\n")
+	b.WriteString("CONTENT:\n")
+	b.WriteString("<complete file content>\n")
+	b.WriteString("```\n\n")
+	b.WriteString("IMPORTANT: For edit_file, you MUST read_file first and use the EXACT text from the file in OLD.\n")
 	b.WriteString("Wait for the OBSERVATION before continuing. Then THINK again.\n\n")
 
 	// Show repo names so agent knows how to address them
@@ -111,8 +143,10 @@ func (ts *ToolSet) ToolDescriptionBlock() string {
 	for _, t := range ts.Available() {
 		b.WriteString(fmt.Sprintf("- **%s** — %s\n  Parameter: %s\n\n", t.Name, t.Description, t.Parameters))
 	}
-	b.WriteString("\nWhen you are finished, use the `done` tool with your final result.\n")
-	b.WriteString("IMPORTANT: You must call at least one tool before calling `done`. Actually read files and explore.\n")
+	b.WriteString("\nWhen finished, call `done`. The ARG of done is your DELIVERABLE — a clean document.\n")
+	b.WriteString("Put ALL your reasoning in THINK lines. The done ARG must contain ZERO thinking — only the final output.\n")
+	b.WriteString("IMPORTANT: Explore the codebase (list_dir, read_file, search_code) BEFORE making changes.\n")
+	b.WriteString("IMPORTANT: ALWAYS read_file BEFORE using edit_file — you need the exact text to match.\n")
 	return b.String()
 }
 
@@ -125,6 +159,10 @@ func (ts *ToolSet) Execute(call ToolCall) ToolResult {
 		return ts.searchCode(call.Args["query"])
 	case "list_dir":
 		return ts.listDir(call.Args["path"])
+	case "write_file":
+		return ts.writeFile(call.Args["path"], call.Args["content"])
+	case "edit_file":
+		return ts.editFile(call.Args["path"], call.Args["old_content"], call.Args["new_content"])
 	case "ask_user":
 		return ts.askUser(call.Args["question"])
 	case "done":
@@ -370,6 +408,138 @@ func (ts *ToolSet) listAllReposRoot() ToolResult {
 	}
 
 	return ToolResult{Tool: "list_dir", Success: true, Output: results.String()}
+}
+
+func (ts *ToolSet) writeFile(path, content string) ToolResult {
+	if path == "" {
+		return ToolResult{Tool: "write_file", Success: false, Output: "Error: path is required. Use format:\nFILE: repo-name/path/to/file\nCONTENT:\n<file content>"}
+	}
+	if content == "" {
+		return ToolResult{Tool: "write_file", Success: false, Output: "Error: content is required"}
+	}
+
+	// Block sensitive files
+	if scanner.IsSensitiveFor(path, ts.excludePatterns) {
+		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
+	}
+
+	// Resolve path — for new files, parent dir must exist
+	resolved, ok := ts.resolvePath(path)
+	if !ok {
+		// Try to resolve the parent directory — file might not exist yet (new file)
+		dir := filepath.Dir(path)
+		resolvedDir, dirOk := ts.resolvePath(dir)
+		if !dirOk {
+			var repos []string
+			for _, r := range ts.repos {
+				repos = append(repos, r.Name)
+			}
+			return ToolResult{
+				Tool:    "write_file",
+				Success: false,
+				Output:  fmt.Sprintf("Directory not found: %s\nAvailable repos: %s\nUse format: repo-name/path/to/file", dir, strings.Join(repos, ", ")),
+			}
+		}
+		resolved = filepath.Join(resolvedDir, filepath.Base(path))
+	}
+
+	if scanner.IsSensitiveFor(resolved, ts.excludePatterns) {
+		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
+	}
+
+	// Ensure parent directory exists
+	if err := os.MkdirAll(filepath.Dir(resolved), 0755); err != nil {
+		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Error creating directory: %v", err)}
+	}
+
+	if err := os.WriteFile(resolved, []byte(content), 0644); err != nil {
+		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Error writing %s: %v", path, err)}
+	}
+
+	return ToolResult{Tool: "write_file", Success: true, Output: fmt.Sprintf("Successfully wrote %s (%d bytes)", path, len(content))}
+}
+
+func (ts *ToolSet) editFile(path, oldContent, newContent string) ToolResult {
+	if path == "" {
+		return ToolResult{Tool: "edit_file", Success: false, Output: "Error: path is required. Use format:\nFILE: repo-name/path/to/file\nOLD:\n<old content>\nNEW:\n<new content>"}
+	}
+	if oldContent == "" {
+		return ToolResult{Tool: "edit_file", Success: false, Output: "Error: OLD content is required — this is the exact text to find and replace"}
+	}
+
+	// Block sensitive files
+	if scanner.IsSensitiveFor(path, ts.excludePatterns) {
+		return ToolResult{Tool: "edit_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
+	}
+
+	resolved, ok := ts.resolvePath(path)
+	if !ok {
+		var repos []string
+		for _, r := range ts.repos {
+			repos = append(repos, r.Name)
+		}
+		return ToolResult{
+			Tool:    "edit_file",
+			Success: false,
+			Output:  fmt.Sprintf("File not found: %s\nAvailable repos: %s\nUse format: repo-name/path/to/file", path, strings.Join(repos, ", ")),
+		}
+	}
+
+	if scanner.IsSensitiveFor(resolved, ts.excludePatterns) {
+		return ToolResult{Tool: "edit_file", Success: false, Output: fmt.Sprintf("Access denied: %s is a sensitive file", path)}
+	}
+
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return ToolResult{Tool: "edit_file", Success: false, Output: fmt.Sprintf("Error reading %s: %v", path, err)}
+	}
+
+	fileContent := string(data)
+
+	// Count occurrences of old_content
+	count := strings.Count(fileContent, oldContent)
+	if count == 0 {
+		// Try trimming trailing whitespace from each line as a fallback
+		oldTrimmed := trimLineEnds(oldContent)
+		fileTrimmed := trimLineEnds(fileContent)
+		if strings.Count(fileTrimmed, oldTrimmed) > 0 {
+			return ToolResult{
+				Tool:    "edit_file",
+				Success: false,
+				Output:  "OLD content not found (exact match). Possible whitespace mismatch — read the file first with read_file and copy the exact content.",
+			}
+		}
+		return ToolResult{
+			Tool:    "edit_file",
+			Success: false,
+			Output:  "OLD content not found in file. Read the file first with read_file and use the exact text you see.",
+		}
+	}
+	if count > 1 {
+		return ToolResult{
+			Tool:    "edit_file",
+			Success: false,
+			Output:  fmt.Sprintf("OLD content matches %d locations in the file. Include more surrounding context to make it unique.", count),
+		}
+	}
+
+	// Exactly one match — apply the replacement
+	newFile := strings.Replace(fileContent, oldContent, newContent, 1)
+
+	if err := os.WriteFile(resolved, []byte(newFile), 0644); err != nil {
+		return ToolResult{Tool: "edit_file", Success: false, Output: fmt.Sprintf("Error writing %s: %v", path, err)}
+	}
+
+	return ToolResult{Tool: "edit_file", Success: true, Output: fmt.Sprintf("Successfully edited %s (replaced %d bytes with %d bytes)", path, len(oldContent), len(newContent))}
+}
+
+// trimLineEnds trims trailing whitespace from each line (for fuzzy whitespace comparison)
+func trimLineEnds(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (ts *ToolSet) askUser(question string) ToolResult {

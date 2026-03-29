@@ -40,3 +40,30 @@ Read the files and implement the changes according to the plan.`, task.Title, ta
 		OnStream:     onStream,
 	})
 }
+
+// runTodoExecution runs a single TODO item in a focused ReAct loop
+func runTodoExecution(ctx context.Context, p provider.Provider, model string, task *models.Task, todo *models.PlanTodo, prevResults string, tools *ToolSet, systemPrompt string, onStep StepCallback, onStream provider.StreamCallback) LoopResult {
+	var context strings.Builder
+
+	context.WriteString(fmt.Sprintf("## Current Step (TODO #%d)\n**%s**\n\n%s\n\n", todo.OrderIndex, todo.Title, todo.Description))
+
+	if task.ImplementationPlan != "" {
+		context.WriteString(fmt.Sprintf("## Overall Plan\n%s\n\n", task.ImplementationPlan))
+	}
+
+	if prevResults != "" {
+		context.WriteString(fmt.Sprintf("## Previous Step Results\n%s\n", prevResults))
+	}
+
+	context.WriteString("Execute this step. Use tools to read files, then call done with your result.")
+
+	return RunLoop(ctx, LoopConfig{
+		Provider:     p,
+		Model:        model,
+		SystemPrompt: systemPrompt,
+		TaskContext:   context.String(),
+		Tools:        tools,
+		OnStep:       onStep,
+		OnStream:     onStream,
+	})
+}

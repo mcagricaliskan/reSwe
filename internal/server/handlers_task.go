@@ -293,17 +293,145 @@ func (s *Server) handleRestoreSession(c fiber.Ctx) error {
 	return writeJSON(c, 200, sess)
 }
 
+// --- General task chat ---
+
+func (s *Server) handleTaskChat(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+	var req struct {
+		Message  string `json:"message"`
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	}
+	if err := c.Bind().JSON(&req); err != nil {
+		return writeError(c, 400, "invalid request body")
+	}
+	if req.Message == "" {
+		return writeError(c, 400, "message is required")
+	}
+	if req.Provider == "" {
+		req.Provider = "ollama"
+	}
+	if req.Model == "" {
+		req.Model = "qwen3.5:27b"
+	}
+
+	cfg := agent.RunConfig{Provider: req.Provider, Model: req.Model}
+	message := s.injectFileRefs(taskID, req.Message)
+
+	go func() {
+		if err := s.orchestrator.Chat(taskID, message, cfg); err != nil {
+			s.hub.Broadcast(models_ws_error(taskID, err.Error()))
+		}
+	}()
+	return writeJSON(c, 202, fiber.Map{"status": "started", "phase": "chat"})
+}
+
+func (s *Server) handleListTaskMessages(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+	msgs, err := s.store.ListTaskMessages(taskID)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, msgs)
+}
+
+func (s *Server) handleClearTaskMessages(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+	if err := s.store.ClearTaskMessages(taskID); err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, fiber.Map{"status": "cleared"})
+}
+
 func (s *Server) handleExecute(c fiber.Ctx) error {
 	taskID, cfg, err := s.parseRunConfig(c)
 	if err != nil {
 		return writeError(c, 400, "invalid request")
 	}
+
+	// If task has TODOs, use TODO-based execution
+	todos, _ := s.store.ListPlanTodos(taskID)
+	if len(todos) > 0 {
+		go func() {
+			if err := s.orchestrator.ExecuteTodos(taskID, cfg); err != nil {
+				s.hub.Broadcast(models_ws_error(taskID, err.Error()))
+			}
+		}()
+		return writeJSON(c, 202, fiber.Map{"status": "started", "phase": "execute-todo", "todo_count": len(todos)})
+	}
+
 	go func() {
 		if err := s.orchestrator.Execute(taskID, cfg); err != nil {
 			s.hub.Broadcast(models_ws_error(taskID, err.Error()))
 		}
 	}()
 	return writeJSON(c, 202, fiber.Map{"status": "started", "phase": "execute"})
+}
+
+func (s *Server) handleListTodos(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+	todos, err := s.store.ListPlanTodos(taskID)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, todos)
+}
+
+func (s *Server) handleUpdateTodo(c fiber.Ctx) error {
+	todoID, err := strconv.ParseInt(c.Params("todoId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid todo id")
+	}
+	todo, err := s.store.GetPlanTodo(todoID)
+	if err != nil {
+		return writeError(c, 404, "todo not found")
+	}
+	var req struct {
+		Title       *string `json:"title"`
+		Description *string `json:"description"`
+		Status      *string `json:"status"`
+	}
+	if err := c.Bind().JSON(&req); err != nil {
+		return writeError(c, 400, "invalid request body")
+	}
+	if req.Title != nil {
+		todo.Title = *req.Title
+	}
+	if req.Description != nil {
+		todo.Description = *req.Description
+	}
+	if req.Status != nil {
+		todo.Status = *req.Status
+	}
+	if err := s.store.UpdatePlanTodo(todo); err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, todo)
+}
+
+func (s *Server) handleExecuteTodos(c fiber.Ctx) error {
+	taskID, cfg, err := s.parseRunConfig(c)
+	if err != nil {
+		return writeError(c, 400, "invalid request")
+	}
+	go func() {
+		if err := s.orchestrator.ExecuteTodos(taskID, cfg); err != nil {
+			s.hub.Broadcast(models_ws_error(taskID, err.Error()))
+		}
+	}()
+	return writeJSON(c, 202, fiber.Map{"status": "started", "phase": "execute-todo"})
 }
 
 func (s *Server) handleAnswer(c fiber.Ctx) error {
@@ -424,7 +552,14 @@ func extractFileRefs(msg string) []string {
 
 func (s *Server) readFileFromRepos(repos []models.Repo, relPath string) string {
 	for _, repo := range repos {
-		fullPath := filepath.Join(repo.Path, relPath)
+		// Paths are stored as "repoName/sub/path" — strip the repo name prefix
+		inner := relPath
+		if strings.HasPrefix(relPath, repo.Name+"/") {
+			inner = relPath[len(repo.Name)+1:]
+		} else if relPath == repo.Name {
+			inner = "."
+		}
+		fullPath := filepath.Join(repo.Path, inner)
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			continue

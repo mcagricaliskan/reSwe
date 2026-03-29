@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
 import { Brain, Wrench, Eye, CheckCircle2, ChevronDown, ChevronRight, Clock, Timer } from 'lucide-react'
-import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 
 export interface AgentStep {
@@ -11,13 +10,16 @@ export interface AgentStep {
   observation: string
   is_final: boolean
   phase: string
+  started_at?: string
+  completed_at?: string
+  duration_ms?: number
 }
 
 interface AgentStepsProps {
   steps: AgentStep[]
   streaming: boolean
-  streamChunk: string // current raw LLM tokens flowing in
-  startTime?: number  // Date.now() when agent started
+  streamChunk: string
+  startTime?: number
 }
 
 function formatElapsed(ms: number): string {
@@ -28,37 +30,97 @@ function formatElapsed(ms: number): string {
   return `${m}m ${rem}s`
 }
 
-function ObservationBlock({ text }: { text: string }) {
+function truncateArg(arg: string, max = 60): string {
+  if (!arg) return ''
+  const oneline = arg.replace(/\n/g, ' ').trim()
+  return oneline.length > max ? oneline.slice(0, max) + '...' : oneline
+}
+
+function CollapsibleStep({ step }: { step: AgentStep }) {
   const [expanded, setExpanded] = useState(false)
-  const isLong = text.length > 500
+  const toggle = () => setExpanded(e => !e)
+
+  if (step.is_final) {
+    return (
+      <div className="space-y-1">
+        <button onClick={toggle} className="flex items-center gap-2 w-full text-left text-xs hover:bg-accent/50 rounded px-1.5 py-1 transition-colors">
+          {expanded ? <ChevronDown className="h-3 w-3 shrink-0 text-emerald-400" /> : <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400" />}
+          <span className={cn("px-1.5 py-0.5 rounded text-[10px] font-bold", "bg-emerald-500/20 text-emerald-400")}>
+            {step.step}
+          </span>
+          <CheckCircle2 className="h-3 w-3 text-emerald-400 shrink-0" />
+          <span className="text-emerald-400 font-medium">done</span>
+          {step.duration_ms != null && step.duration_ms > 0 && (
+            <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5 shrink-0">
+              <Timer className="h-2.5 w-2.5" />
+              {formatElapsed(step.duration_ms)}
+            </span>
+          )}
+        </button>
+        {expanded && step.action_arg && (
+          <div className="ml-6 pl-2 border-l-2 border-emerald-500/30">
+            <pre className="text-sm text-foreground/80 whitespace-pre-wrap bg-secondary/30 rounded p-3 max-h-96 overflow-auto">
+              {step.action_arg}
+            </pre>
+          </div>
+        )}
+      </div>
+    )
+  }
 
   return (
-    <div className="flex gap-2 pl-2 border-l-2 border-amber-500/30">
-      <Eye className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-amber-400 uppercase">Observation</span>
-          {isLong && (
-            <Button
-              variant="ghost"
-              size="xs"
-              className="h-5 px-1 text-xs text-muted-foreground"
-              onClick={() => setExpanded(!expanded)}
-            >
-              {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-              {expanded ? 'collapse' : `${text.length} chars`}
-            </Button>
+    <div className="space-y-1">
+      {/* Collapsed row */}
+      <button onClick={toggle} className="flex items-center gap-2 w-full text-left text-xs hover:bg-accent/50 rounded px-1.5 py-1 transition-colors">
+        {expanded ? <ChevronDown className="h-3 w-3 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />}
+        <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-secondary text-muted-foreground">
+          {step.step}
+        </span>
+        {step.action ? (
+          <span className="text-blue-400 font-mono truncate min-w-0">
+            {step.action}(<span className="text-foreground/50">{truncateArg(step.action_arg)}</span>)
+          </span>
+        ) : (
+          <span className="text-muted-foreground italic">thinking...</span>
+        )}
+        {step.duration_ms != null && step.duration_ms > 0 && (
+          <span className="ml-auto text-muted-foreground/60 flex items-center gap-0.5 shrink-0">
+            <Timer className="h-2.5 w-2.5" />
+            {formatElapsed(step.duration_ms)}
+          </span>
+        )}
+      </button>
+
+      {/* Expanded details */}
+      {expanded && (
+        <div className="ml-6 space-y-1.5">
+          {step.think && (
+            <div className="flex gap-2 pl-2 border-l-2 border-violet-500/30">
+              <Brain className="h-3.5 w-3.5 text-violet-400 shrink-0 mt-0.5" />
+              <p className="text-sm text-foreground/80">{step.think}</p>
+            </div>
+          )}
+          {step.action && (
+            <div className="flex gap-2 pl-2 border-l-2 border-blue-500/30">
+              <Wrench className="h-3.5 w-3.5 text-blue-400 shrink-0 mt-0.5" />
+              <code className="text-xs font-mono text-blue-300 break-all whitespace-pre-wrap">
+                {step.action}({step.action_arg})
+              </code>
+            </div>
+          )}
+          {step.observation && (
+            <div className="flex gap-2 pl-2 border-l-2 border-amber-500/30">
+              <Eye className="h-3.5 w-3.5 text-amber-400 shrink-0 mt-0.5" />
+              <pre className={cn(
+                "text-xs text-foreground/60 whitespace-pre-wrap bg-secondary/50 rounded p-2 overflow-auto flex-1 min-w-0",
+                "max-h-64"
+              )}>
+                {step.observation}
+              </pre>
+            </div>
           )}
         </div>
-        <pre className={cn(
-          "text-xs text-foreground/60 mt-0.5 whitespace-pre-wrap bg-secondary/50 rounded p-2 overflow-auto",
-          expanded ? "max-h-96" : "max-h-32"
-        )}>
-          {!expanded && isLong
-            ? text.slice(0, 500) + '\n... (click to expand)'
-            : text}
-        </pre>
-      </div>
+      )}
     </div>
   )
 }
@@ -68,7 +130,6 @@ export default function AgentSteps({ steps, streaming, streamChunk, startTime }:
   const [finalElapsed, setFinalElapsed] = useState(0)
   const bottomRef = useRef<HTMLDivElement>(null)
 
-  // Timer — ticks while running, freezes final value when done
   useEffect(() => {
     if (!streaming || !startTime) return
     setFinalElapsed(0)
@@ -77,14 +138,10 @@ export default function AgentSteps({ steps, streaming, streamChunk, startTime }:
     }, 1000)
     return () => {
       clearInterval(interval)
-      // Capture final elapsed when streaming stops
-      if (startTime) {
-        setFinalElapsed(Date.now() - startTime)
-      }
+      if (startTime) setFinalElapsed(Date.now() - startTime)
     }
   }, [streaming, startTime])
 
-  // Auto-scroll to bottom
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [steps.length, streamChunk])
@@ -122,74 +179,24 @@ export default function AgentSteps({ steps, streaming, streamChunk, startTime }:
       </div>
 
       {/* Steps list */}
-      <div className="flex-1 overflow-auto p-4 space-y-3">
+      <div className="flex-1 overflow-auto p-2 space-y-0.5">
         {steps.map((step, i) => (
-          <div key={i} className="space-y-1.5">
-            {/* Step header */}
-            <div className="flex items-center gap-2 text-xs text-muted-foreground font-medium">
-              <span className={cn(
-                "px-1.5 py-0.5 rounded text-[10px] font-bold",
-                step.is_final ? "bg-emerald-500/20 text-emerald-400" : "bg-secondary text-muted-foreground"
-              )}>
-                {step.step}
-              </span>
-              {step.action && (
-                <span className="text-blue-400 font-mono">{step.action}</span>
-              )}
-              {step.is_final && <span className="text-emerald-400">done</span>}
-            </div>
-
-            {/* Think */}
-            {step.think && (
-              <div className="flex gap-2 pl-2 border-l-2 border-violet-500/30">
-                <Brain className="h-3.5 w-3.5 text-violet-400 shrink-0 mt-0.5" />
-                <p className="text-sm text-foreground/80">{step.think}</p>
-              </div>
-            )}
-
-            {/* Action */}
-            {step.action && step.action !== 'done' && (
-              <div className="flex gap-2 pl-2 border-l-2 border-blue-500/30">
-                <Wrench className="h-3.5 w-3.5 text-blue-400 shrink-0 mt-0.5" />
-                <code className="text-xs font-mono text-blue-300 break-all">
-                  {step.action}({step.action_arg.length > 100 ? step.action_arg.slice(0, 100) + '...' : step.action_arg})
-                </code>
-              </div>
-            )}
-
-            {/* Observation */}
-            {step.observation && !step.is_final && (
-              <ObservationBlock text={step.observation} />
-            )}
-
-            {/* Final result */}
-            {step.is_final && step.action_arg && (
-              <div className="flex gap-2 pl-2 border-l-2 border-emerald-500/30">
-                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400 shrink-0 mt-0.5" />
-                <div className="min-w-0 flex-1">
-                  <span className="text-xs font-semibold text-emerald-400 uppercase">Final Result</span>
-                  <pre className="text-sm text-foreground/80 mt-1 whitespace-pre-wrap bg-secondary/30 rounded p-3 max-h-96 overflow-auto">
-                    {step.action_arg}
-                  </pre>
-                </div>
-              </div>
-            )}
-          </div>
+          <CollapsibleStep key={i} step={step} />
         ))}
 
-        {/* Live streaming indicator — shows actual tokens flowing */}
+        {/* Live streaming indicator */}
         {streaming && (
-          <div className="space-y-1.5">
+          <div className="space-y-1 px-1.5 py-1">
             <div className="flex items-center gap-2 text-xs text-muted-foreground font-medium">
+              <Clock className="h-3 w-3 animate-spin shrink-0" />
               <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-primary/20 text-primary animate-pulse">
                 {steps.length + 1}
               </span>
               <span className="animate-pulse">thinking...</span>
-              <Clock className="h-3 w-3 animate-spin" />
             </div>
 
             {streamChunk && (
-              <div className="flex gap-2 pl-2 border-l-2 border-primary/30">
+              <div className="ml-6 flex gap-2 pl-2 border-l-2 border-primary/30">
                 <Brain className="h-3.5 w-3.5 text-primary shrink-0 mt-0.5 animate-pulse" />
                 <pre className="text-xs text-foreground/50 font-mono whitespace-pre-wrap max-h-24 overflow-auto">
                   {streamChunk.slice(-500)}

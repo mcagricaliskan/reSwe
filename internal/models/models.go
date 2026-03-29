@@ -61,6 +61,7 @@ type Task struct {
 	UpdatedAt           time.Time      `json:"updated_at"`
 	Clarifications      []Clarification `json:"clarifications,omitempty"`
 	Executions          []Execution    `json:"executions,omitempty"`
+	Todos               []PlanTodo     `json:"todos,omitempty"`
 }
 
 type Clarification struct {
@@ -91,6 +92,15 @@ type PlanMessage struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// TaskMessage is a single message in the general task chat
+type TaskMessage struct {
+	ID        int64     `json:"id"`
+	TaskID    int64     `json:"task_id"`
+	Role      string    `json:"role"` // "user", "assistant"
+	Content   string    `json:"content"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // AgentQuestion is a question the agent asks the user during planning (pause/resume)
 type AgentQuestion struct {
 	ID        int64     `json:"id"`
@@ -101,6 +111,21 @@ type AgentQuestion struct {
 	Answer    string    `json:"answer"`
 	Answered  bool      `json:"answered"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// PlanTodo is an ordered, dependency-aware task in the implementation plan
+type PlanTodo struct {
+	ID          int64     `json:"id"`
+	TaskID      int64     `json:"task_id"`
+	RunID       int64     `json:"run_id"`
+	OrderIndex  int       `json:"order_index"`
+	Title       string    `json:"title"`
+	Description string    `json:"description"`
+	Status      string    `json:"status"` // pending, in_progress, done, failed
+	DependsOn   []int64   `json:"depends_on"`
+	Result      string    `json:"result"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Execution struct {
@@ -131,6 +156,9 @@ type AgentRun struct {
 	RepoSnapshot   string    `json:"repo_snapshot,omitempty"`
 	PausedMessages string    `json:"paused_messages,omitempty"` // JSON: conversation history at pause point
 	StepCount      int       `json:"step_count"`
+	StartedAt      time.Time `json:"started_at"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	DurationMs     int64     `json:"duration_ms"`
 	CreatedAt      time.Time `json:"created_at"`
 	UpdatedAt      time.Time `json:"updated_at"`
 	Steps          []AgentStep     `json:"steps,omitempty"`
@@ -147,6 +175,9 @@ type AgentStep struct {
 	ActionArg   string    `json:"action_arg"`
 	Observation string    `json:"observation"`
 	IsFinal     bool      `json:"is_final"`
+	StartedAt   time.Time `json:"started_at"`
+	CompletedAt time.Time `json:"completed_at"`
+	DurationMs  int64     `json:"duration_ms"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -159,6 +190,7 @@ const (
 	WSTypeAgentDone    WSMessageType = "agent_done"
 	WSTypeAgentError   WSMessageType = "agent_error"
 	WSTypeAgentWaiting WSMessageType = "agent_waiting"
+	WSTypeTodoUpdate   WSMessageType = "todo_update"
 	WSTypeTaskUpdate  WSMessageType = "task_update"
 	WSTypeClarify     WSMessageType = "clarify"
 )

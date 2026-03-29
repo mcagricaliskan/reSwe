@@ -130,6 +130,16 @@ func (s *Server) setupRoutes() {
 	api.Get("/tasks/:taskId/questions", s.handleGetPendingQuestions)
 	api.Post("/tasks/:taskId/execute", s.handleExecute)
 
+	// Plan TODOs
+	api.Get("/tasks/:taskId/todos", s.handleListTodos)
+	api.Put("/todos/:todoId", s.handleUpdateTodo)
+	api.Post("/tasks/:taskId/execute-todos", s.handleExecuteTodos)
+
+	// General task chat
+	api.Post("/tasks/:taskId/chat", s.handleTaskChat)
+	api.Get("/tasks/:taskId/chat/messages", s.handleListTaskMessages)
+	api.Delete("/tasks/:taskId/chat/messages", s.handleClearTaskMessages)
+
 	// Chat sessions
 	api.Get("/tasks/:taskId/sessions", s.handleListSessions)
 	api.Get("/sessions/:sessionId", s.handleGetSession)

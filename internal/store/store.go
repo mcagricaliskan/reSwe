@@ -49,6 +49,11 @@ type Store interface {
 	ListPlanMessages(taskID int64) ([]models.PlanMessage, error)
 	ClearPlanMessages(taskID int64) error
 
+	// General task chat
+	AddTaskMessage(taskID int64, role, content string) (*models.TaskMessage, error)
+	ListTaskMessages(taskID int64) ([]models.TaskMessage, error)
+	ClearTaskMessages(taskID int64) error
+
 	// Agent Runs
 	CreateAgentRun(taskID int64, phase, provider, model, systemPrompt string) (*models.AgentRun, error)
 	UpdateAgentRun(run *models.AgentRun) error
@@ -59,6 +64,13 @@ type Store interface {
 	// Agent Steps
 	CreateAgentStep(runID int64, step *models.AgentStep) (*models.AgentStep, error)
 	ListAgentSteps(runID int64) ([]models.AgentStep, error)
+
+	// Plan TODOs
+	CreatePlanTodo(todo *models.PlanTodo) (*models.PlanTodo, error)
+	ListPlanTodos(taskID int64) ([]models.PlanTodo, error)
+	UpdatePlanTodo(todo *models.PlanTodo) error
+	ClearPlanTodos(taskID int64) error
+	GetPlanTodo(id int64) (*models.PlanTodo, error)
 
 	// Agent Questions (pause/resume)
 	CreateAgentQuestion(runID, taskID int64, question string, options []string) (*models.AgentQuestion, error)

@@ -246,6 +246,22 @@ export interface ChatSession {
   messages?: PlanMessage[]
 }
 
+// General task chat
+export interface TaskMessage {
+  id: number
+  task_id: number
+  role: string
+  content: string
+  created_at: string
+}
+
+export const taskChat = (taskId: number | string, message: string) =>
+  request(`/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message }) })
+export const listTaskMessages = (taskId: number | string) =>
+  request<TaskMessage[]>(`/tasks/${taskId}/chat/messages`)
+export const clearTaskMessages = (taskId: number | string) =>
+  request(`/tasks/${taskId}/chat/messages`, { method: 'DELETE' })
+
 export const listSessions = (taskId: number | string) =>
   request<ChatSession[]>(`/tasks/${taskId}/sessions`)
 export const getSession = (sessionId: number) =>
@@ -310,6 +326,9 @@ export interface PersistedAgentRun {
   error: string
   system_prompt: string
   step_count: number
+  started_at: string
+  completed_at?: string
+  duration_ms: number
   created_at: string
   updated_at: string
   steps?: PersistedAgentStep[]
@@ -324,6 +343,9 @@ export interface PersistedAgentStep {
   action_arg: string
   observation: string
   is_final: boolean
+  started_at: string
+  completed_at: string
+  duration_ms: number
   created_at: string
 }
 

@@ -97,6 +97,14 @@ func (s *SQLiteStore) migrate() error {
 		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS task_messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		role TEXT NOT NULL,
+		content TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS chat_sessions (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -142,6 +150,20 @@ func (s *SQLiteStore) migrate() error {
 		answer TEXT DEFAULT '',
 		answered INTEGER DEFAULT 0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS plan_todos (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+		run_id INTEGER DEFAULT 0,
+		order_index INTEGER NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		depends_on TEXT DEFAULT '[]',
+		result TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
 	CREATE TABLE IF NOT EXISTS agent_steps (
@@ -203,6 +225,13 @@ func (s *SQLiteStore) migrate() error {
 	migrations := []string{
 		"ALTER TABLE repos ADD COLUMN type TEXT DEFAULT 'git'",
 		"ALTER TABLE project_files ADD COLUMN is_dir INTEGER DEFAULT 0",
+		// Agent timing fields
+		"ALTER TABLE agent_runs ADD COLUMN started_at DATETIME",
+		"ALTER TABLE agent_runs ADD COLUMN completed_at DATETIME",
+		"ALTER TABLE agent_runs ADD COLUMN duration_ms INTEGER DEFAULT 0",
+		"ALTER TABLE agent_steps ADD COLUMN started_at DATETIME",
+		"ALTER TABLE agent_steps ADD COLUMN completed_at DATETIME",
+		"ALTER TABLE agent_steps ADD COLUMN duration_ms INTEGER DEFAULT 0",
 	}
 	for _, m := range migrations {
 		s.db.Exec(m) // ignore errors — column may already exist
@@ -456,6 +485,9 @@ func (s *SQLiteStore) GetTask(id int64) (*models.Task, error) {
 	executions, _ := s.ListExecutions(id)
 	t.Executions = executions
 
+	todos, _ := s.ListPlanTodos(id)
+	t.Todos = todos
+
 	return t, nil
 }
 
@@ -616,6 +648,47 @@ func (s *SQLiteStore) listSessionMessages(sessionID int64) ([]models.PlanMessage
 		msgs = append(msgs, m)
 	}
 	return msgs, nil
+}
+
+// --- Task Messages ---
+
+func (s *SQLiteStore) AddTaskMessage(taskID int64, role, content string) (*models.TaskMessage, error) {
+	now := time.Now()
+	res, err := s.db.Exec(
+		"INSERT INTO task_messages (task_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+		taskID, role, content, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &models.TaskMessage{ID: id, TaskID: taskID, Role: role, Content: content, CreatedAt: now}, nil
+}
+
+func (s *SQLiteStore) ListTaskMessages(taskID int64) ([]models.TaskMessage, error) {
+	rows, err := s.db.Query(
+		"SELECT id, task_id, role, content, created_at FROM task_messages WHERE task_id = ? ORDER BY created_at",
+		taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []models.TaskMessage
+	for rows.Next() {
+		var m models.TaskMessage
+		if err := rows.Scan(&m.ID, &m.TaskID, &m.Role, &m.Content, &m.CreatedAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (s *SQLiteStore) ClearTaskMessages(taskID int64) error {
+	_, err := s.db.Exec("DELETE FROM task_messages WHERE task_id = ?", taskID)
+	return err
 }
 
 // --- Plan Messages ---
@@ -807,9 +880,9 @@ func (s *SQLiteStore) CreateAgentRun(taskID int64, phase, provider, model, syste
 	}
 
 	res, err := s.db.Exec(
-		`INSERT INTO agent_runs (task_id, project_id, project_uuid, phase, provider, model, system_prompt, repo_snapshot, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		taskID, projectID, projectUUID, phase, provider, model, systemPrompt, repoSnapshot, now, now,
+		`INSERT INTO agent_runs (task_id, project_id, project_uuid, phase, provider, model, system_prompt, repo_snapshot, started_at, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		taskID, projectID, projectUUID, phase, provider, model, systemPrompt, repoSnapshot, now, now, now,
 	)
 	if err != nil {
 		return nil, err
@@ -826,6 +899,7 @@ func (s *SQLiteStore) CreateAgentRun(taskID int64, phase, provider, model, syste
 		Status:       "running",
 		SystemPrompt: systemPrompt,
 		RepoSnapshot: repoSnapshot,
+		StartedAt:    now,
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}, nil
@@ -834,18 +908,19 @@ func (s *SQLiteStore) CreateAgentRun(taskID int64, phase, provider, model, syste
 func (s *SQLiteStore) UpdateAgentRun(run *models.AgentRun) error {
 	run.UpdatedAt = time.Now()
 	_, err := s.db.Exec(
-		`UPDATE agent_runs SET status = ?, final_result = ?, error = ?, paused_messages = ?, step_count = ?, updated_at = ? WHERE id = ?`,
-		run.Status, run.FinalResult, run.Error, run.PausedMessages, run.StepCount, run.UpdatedAt, run.ID,
+		`UPDATE agent_runs SET status = ?, final_result = ?, error = ?, paused_messages = ?, step_count = ?, completed_at = ?, duration_ms = ?, updated_at = ? WHERE id = ?`,
+		run.Status, run.FinalResult, run.Error, run.PausedMessages, run.StepCount, run.CompletedAt, run.DurationMs, run.UpdatedAt, run.ID,
 	)
 	return err
 }
 
-const agentRunCols = `id, task_id, project_id, project_uuid, phase, provider, model, status, final_result, error, system_prompt, repo_snapshot, paused_messages, step_count, created_at, updated_at`
+const agentRunCols = `id, task_id, project_id, project_uuid, phase, provider, model, status, final_result, error, system_prompt, repo_snapshot, paused_messages, step_count, started_at, completed_at, duration_ms, created_at, updated_at`
 
 func scanAgentRun(row interface{ Scan(...interface{}) error }) (*models.AgentRun, error) {
 	r := &models.AgentRun{}
 	err := row.Scan(&r.ID, &r.TaskID, &r.ProjectID, &r.ProjectUUID, &r.Phase, &r.Provider, &r.Model, &r.Status,
-		&r.FinalResult, &r.Error, &r.SystemPrompt, &r.RepoSnapshot, &r.PausedMessages, &r.StepCount, &r.CreatedAt, &r.UpdatedAt)
+		&r.FinalResult, &r.Error, &r.SystemPrompt, &r.RepoSnapshot, &r.PausedMessages, &r.StepCount,
+		&r.StartedAt, &r.CompletedAt, &r.DurationMs, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -899,10 +974,18 @@ func (s *SQLiteStore) CreateAgentStep(runID int64, step *models.AgentStep) (*mod
 	if step.IsFinal {
 		isFinal = 1
 	}
+	// If CompletedAt not set, use now
+	if step.CompletedAt.IsZero() {
+		step.CompletedAt = now
+	}
+	// Calculate duration if StartedAt is set
+	if !step.StartedAt.IsZero() {
+		step.DurationMs = step.CompletedAt.Sub(step.StartedAt).Milliseconds()
+	}
 	res, err := s.db.Exec(
-		`INSERT INTO agent_steps (run_id, step_number, think, action, action_arg, observation, is_final, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		runID, step.StepNumber, step.Think, step.Action, step.ActionArg, step.Observation, isFinal, now,
+		`INSERT INTO agent_steps (run_id, step_number, think, action, action_arg, observation, is_final, started_at, completed_at, duration_ms, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, step.StepNumber, step.Think, step.Action, step.ActionArg, step.Observation, isFinal, step.StartedAt, step.CompletedAt, step.DurationMs, now,
 	)
 	if err != nil {
 		return nil, err
@@ -916,7 +999,7 @@ func (s *SQLiteStore) CreateAgentStep(runID int64, step *models.AgentStep) (*mod
 
 func (s *SQLiteStore) ListAgentSteps(runID int64) ([]models.AgentStep, error) {
 	rows, err := s.db.Query(
-		`SELECT id, run_id, step_number, think, action, action_arg, observation, is_final, created_at
+		`SELECT id, run_id, step_number, think, action, action_arg, observation, is_final, started_at, completed_at, duration_ms, created_at
 		 FROM agent_steps WHERE run_id = ? ORDER BY step_number`, runID,
 	)
 	if err != nil {
@@ -929,7 +1012,7 @@ func (s *SQLiteStore) ListAgentSteps(runID int64) ([]models.AgentStep, error) {
 		var st models.AgentStep
 		var isFinal int
 		if err := rows.Scan(&st.ID, &st.RunID, &st.StepNumber, &st.Think, &st.Action,
-			&st.ActionArg, &st.Observation, &isFinal, &st.CreatedAt); err != nil {
+			&st.ActionArg, &st.Observation, &isFinal, &st.StartedAt, &st.CompletedAt, &st.DurationMs, &st.CreatedAt); err != nil {
 			return nil, err
 		}
 		st.IsFinal = isFinal != 0
@@ -1013,6 +1096,86 @@ func (s *SQLiteStore) ListPendingQuestions(taskID int64) ([]models.AgentQuestion
 		qs = append(qs, q)
 	}
 	return qs, nil
+}
+
+// --- Plan TODOs ---
+
+func (s *SQLiteStore) CreatePlanTodo(todo *models.PlanTodo) (*models.PlanTodo, error) {
+	now := time.Now()
+	depsJSON, _ := json.Marshal(todo.DependsOn)
+	res, err := s.db.Exec(
+		`INSERT INTO plan_todos (task_id, run_id, order_index, title, description, status, depends_on, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		todo.TaskID, todo.RunID, todo.OrderIndex, todo.Title, todo.Description, todo.Status, string(depsJSON), now, now,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	todo.ID = id
+	todo.CreatedAt = now
+	todo.UpdatedAt = now
+	return todo, nil
+}
+
+func (s *SQLiteStore) ListPlanTodos(taskID int64) ([]models.PlanTodo, error) {
+	rows, err := s.db.Query(
+		`SELECT id, task_id, run_id, order_index, title, description, status, depends_on, result, created_at, updated_at
+		 FROM plan_todos WHERE task_id = ? ORDER BY order_index`, taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var todos []models.PlanTodo
+	for rows.Next() {
+		var t models.PlanTodo
+		var depsJSON string
+		if err := rows.Scan(&t.ID, &t.TaskID, &t.RunID, &t.OrderIndex, &t.Title, &t.Description,
+			&t.Status, &depsJSON, &t.Result, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(depsJSON), &t.DependsOn)
+		if t.DependsOn == nil {
+			t.DependsOn = []int64{}
+		}
+		todos = append(todos, t)
+	}
+	return todos, nil
+}
+
+func (s *SQLiteStore) UpdatePlanTodo(todo *models.PlanTodo) error {
+	todo.UpdatedAt = time.Now()
+	depsJSON, _ := json.Marshal(todo.DependsOn)
+	_, err := s.db.Exec(
+		`UPDATE plan_todos SET title = ?, description = ?, status = ?, depends_on = ?, result = ?, updated_at = ? WHERE id = ?`,
+		todo.Title, todo.Description, todo.Status, string(depsJSON), todo.Result, todo.UpdatedAt, todo.ID,
+	)
+	return err
+}
+
+func (s *SQLiteStore) ClearPlanTodos(taskID int64) error {
+	_, err := s.db.Exec("DELETE FROM plan_todos WHERE task_id = ?", taskID)
+	return err
+}
+
+func (s *SQLiteStore) GetPlanTodo(id int64) (*models.PlanTodo, error) {
+	t := &models.PlanTodo{}
+	var depsJSON string
+	err := s.db.QueryRow(
+		`SELECT id, task_id, run_id, order_index, title, description, status, depends_on, result, created_at, updated_at
+		 FROM plan_todos WHERE id = ?`, id,
+	).Scan(&t.ID, &t.TaskID, &t.RunID, &t.OrderIndex, &t.Title, &t.Description,
+		&t.Status, &depsJSON, &t.Result, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	json.Unmarshal([]byte(depsJSON), &t.DependsOn)
+	if t.DependsOn == nil {
+		t.DependsOn = []int64{}
+	}
+	return t, nil
 }
 
 // --- Exclude Rules (global) ---
