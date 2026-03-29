@@ -334,6 +334,20 @@ export const getLatestRun = (taskId: number | string) =>
 export const getAgentRun = (runId: number) =>
   request<PersistedAgentRun>(`/runs/${runId}`)
 
+// Project Files (@-mention)
+export interface ProjectFile {
+  id: number
+  project_id: number
+  repo_id: number
+  rel_path: string
+  size: number
+  is_dir: boolean
+}
+export const searchProjectFiles = (projectId: number | string, q: string) =>
+  request<ProjectFile[]>(`/projects/${projectId}/files?q=${encodeURIComponent(q)}`)
+export const syncProjectFiles = (projectId: number | string) =>
+  request<{ count: number }>(`/projects/${projectId}/sync-files`, { method: 'POST' })
+
 // System
 export interface PickDirectoryResult {
   path?: string

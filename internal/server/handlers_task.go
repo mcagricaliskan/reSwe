@@ -1,10 +1,16 @@
 package server
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cagri/reswe/internal/agent"
+	"github.com/cagri/reswe/internal/models"
 	"github.com/gofiber/fiber/v3"
 )
 
@@ -171,8 +177,11 @@ func (s *Server) handlePlanChat(c fiber.Ctx) error {
 
 	cfg := agent.RunConfig{Provider: req.Provider, Model: req.Model}
 
+	// Inject @file reference contents into the message
+	message := s.injectFileRefs(taskID, req.Message)
+
 	go func() {
-		if err := s.orchestrator.PlanChat(taskID, req.Message, cfg); err != nil {
+		if err := s.orchestrator.PlanChat(taskID, message, cfg); err != nil {
 			s.hub.Broadcast(models_ws_error(taskID, err.Error()))
 		}
 	}()
@@ -393,4 +402,80 @@ func (s *Server) handleGetLatestRun(c fiber.Ctx) error {
 		return writeJSON(c, 200, []interface{}{})
 	}
 	return writeJSON(c, 200, run)
+}
+
+// --- File reference helpers ---
+
+var fileRefRe = regexp.MustCompile(`@([\w./\-]+[\w\-])`)
+
+func extractFileRefs(msg string) []string {
+	matches := fileRefRe.FindAllStringSubmatch(msg, -1)
+	seen := make(map[string]bool)
+	var refs []string
+	for _, m := range matches {
+		path := m[1]
+		if !seen[path] {
+			seen[path] = true
+			refs = append(refs, path)
+		}
+	}
+	return refs
+}
+
+func (s *Server) readFileFromRepos(repos []models.Repo, relPath string) string {
+	for _, repo := range repos {
+		fullPath := filepath.Join(repo.Path, relPath)
+		info, err := os.Stat(fullPath)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			// List directory contents for folder references
+			entries, err := os.ReadDir(fullPath)
+			if err != nil {
+				continue
+			}
+			var lines []string
+			for _, e := range entries {
+				name := e.Name()
+				if e.IsDir() {
+					name += "/"
+				}
+				lines = append(lines, name)
+			}
+			return strings.Join(lines, "\n")
+		}
+		content, err := s.scanner.ReadFile(fullPath, 100*1024)
+		if err == nil {
+			return content
+		}
+	}
+	return ""
+}
+
+func (s *Server) injectFileRefs(taskID int64, message string) string {
+	refs := extractFileRefs(message)
+	if len(refs) == 0 {
+		return message
+	}
+
+	task, err := s.store.GetTask(taskID)
+	if err != nil {
+		return message
+	}
+	repos, err := s.store.ListRepos(task.ProjectID)
+	if err != nil || len(repos) == 0 {
+		return message
+	}
+
+	var b strings.Builder
+	b.WriteString(message)
+	b.WriteString("\n\n--- Referenced Files ---\n")
+	for _, ref := range refs {
+		content := s.readFileFromRepos(repos, ref)
+		if content != "" {
+			b.WriteString(fmt.Sprintf("\n### %s\n```\n%s\n```\n", ref, content))
+		}
+	}
+	return b.String()
 }

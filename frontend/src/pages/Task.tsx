@@ -17,6 +17,8 @@ import type { Task, PlanMessage, ChatSession, AgentQuestion } from '@/lib/api'
 import * as api from '@/lib/api'
 import { wsClient } from '@/lib/ws'
 import type { AgentStep } from '@/components/AgentSteps'
+import { useFileMention } from '@/lib/useFileMention'
+import { FileMention } from '@/components/FileMention'
 
 function formatDate(d: string) {
   return new Date(d).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: '2-digit', minute: '2-digit' })
@@ -47,6 +49,7 @@ export default function TaskPage() {
   const chatEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const planRef = useRef<HTMLDivElement>(null)
+  const mention = useFileMention(task?.project_id)
 
   const loadTask = useCallback(async () => {
     try { setTask(await api.getTask(id!)) } catch { toast.error('Failed to load task') }
@@ -206,7 +209,74 @@ export default function TaskPage() {
     } catch { toast.error('Failed to cancel') }
   }
 
+  function handleInputChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+    const value = e.target.value
+    const pos = e.target.selectionStart ?? value.length
+    setInput(value)
+
+    if (mention.isActive) {
+      const q = value.slice(mention.mentionStart + 1, pos)
+      if (q.includes(' ') || q.includes('\n') || pos <= mention.mentionStart) {
+        mention.deactivate()
+      } else {
+        mention.setQuery(q)
+      }
+    } else {
+      // Check if user just typed @
+      if (pos >= 1 && value[pos - 1] === '@') {
+        const charBefore = pos >= 2 ? value[pos - 2] : ' '
+        if (charBefore === ' ' || charBefore === '\n' || pos === 1) {
+          mention.activate(pos - 1)
+        }
+      }
+    }
+  }
+
+  function selectMentionFile(file: api.ProjectFile) {
+    const before = input.slice(0, mention.mentionStart)
+    const cursorPos = textareaRef.current?.selectionStart ?? input.length
+    const after = input.slice(cursorPos)
+    setInput(before + '@' + file.rel_path + ' ' + after)
+    mention.deactivate()
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }
+
+  function completeMentionFolder(file: api.ProjectFile) {
+    // Tab on a folder: fill path + "/" and keep dropdown open (like terminal tab-complete)
+    const before = input.slice(0, mention.mentionStart)
+    const cursorPos = textareaRef.current?.selectionStart ?? input.length
+    const after = input.slice(cursorPos)
+    const filled = file.rel_path + '/'
+    setInput(before + '@' + filled + after)
+    mention.setQuery(filled)
+    mention.setSelectedIndex(0)
+    setTimeout(() => {
+      if (textareaRef.current) {
+        const newPos = mention.mentionStart + 1 + filled.length
+        textareaRef.current.selectionStart = newPos
+        textareaRef.current.selectionEnd = newPos
+        textareaRef.current.focus()
+      }
+    }, 0)
+  }
+
   function handleKeyDown(e: React.KeyboardEvent) {
+    if (mention.isActive && mention.results.length > 0) {
+      if (e.key === 'ArrowDown') { e.preventDefault(); mention.setSelectedIndex(i => Math.min(i + 1, mention.results.length - 1)); return }
+      if (e.key === 'ArrowUp') { e.preventDefault(); mention.setSelectedIndex(i => Math.max(i - 1, 0)); return }
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        const selected = mention.results[mention.selectedIndex]
+        if (selected.is_dir) {
+          completeMentionFolder(selected)
+        } else {
+          selectMentionFile(selected)
+        }
+        return
+      }
+      if (e.key === 'Enter') { e.preventDefault(); selectMentionFile(mention.results[mention.selectedIndex]); return }
+      if (e.key === 'Escape') { e.preventDefault(); mention.deactivate(); return }
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
   }
 
@@ -241,7 +311,7 @@ export default function TaskPage() {
 
   // --- Breadcrumb (shared) ---
   const breadcrumb = (
-    <div className="flex items-center gap-1 text-sm text-muted-foreground mb-3 overflow-hidden">
+    <div className="flex items-center gap-1 text-sm text-muted-foreground mb-2 overflow-hidden">
       <Link to="/" className="hover:text-foreground transition-colors shrink-0">Projects</Link>
       <ChevronRight className="h-3 w-3 shrink-0" />
       <Link to={`/projects/${task.project_id}`} className="hover:text-foreground transition-colors shrink-0">Project</Link>
@@ -419,7 +489,7 @@ export default function TaskPage() {
   const chatPanel = (
     <div className="flex flex-col h-full">
       <ScrollArea className="flex-1">
-        <div className="space-y-3 p-3">
+        <div className="space-y-2.5 p-2.5">
           {messages.length === 0 && !activePhase && (
             <div className="text-center py-6 text-muted-foreground">
               <p className="text-sm">Send a message to start planning.</p>
@@ -511,13 +581,22 @@ export default function TaskPage() {
         </div>
       </ScrollArea>
 
-      <div className="shrink-0 border-t p-2">
-        <div className="flex gap-2 items-end">
+      <div className="shrink-0 border-t p-1.5">
+        <div className="relative flex gap-2 items-end">
+          {mention.isActive && (
+            <FileMention
+              results={mention.results}
+              selectedIndex={mention.selectedIndex}
+              loading={mention.loading}
+              onSelect={selectMentionFile}
+              onHover={mention.setSelectedIndex}
+            />
+          )}
           <Textarea
             ref={textareaRef}
-            placeholder={activePhase ? 'Agent working...' : messages.length === 0 ? 'Describe what to do...' : 'Revise, ask, or /execute...'}
+            placeholder={activePhase ? 'Agent working...' : messages.length === 0 ? 'Describe what to do... (@ to reference files)' : 'Revise, ask, or /execute... (@ to reference files)'}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={handleInputChange}
             onKeyDown={handleKeyDown}
             disabled={!!activePhase}
             rows={1}
@@ -567,7 +646,7 @@ export default function TaskPage() {
   )
 
   return (
-    <div className="flex flex-col h-[calc(100vh-100px)]">
+    <div className="flex flex-col h-[calc(100vh-64px)]">
       {breadcrumb}
 
       <div className="flex-1 min-h-0">
@@ -586,7 +665,7 @@ export default function TaskPage() {
               </div>
               <div ref={planRef} className="relative flex-1 min-h-0">
                 <ScrollArea className="h-full">
-                  <div className="p-5 prose prose-sm max-w-none dark:prose-invert" onMouseUp={handlePlanMouseUp}>
+                  <div className="p-4 prose prose-sm max-w-none dark:prose-invert" onMouseUp={handlePlanMouseUp}>
                     <ReactMarkdown>{task.implementation_plan}</ReactMarkdown>
                   </div>
                 </ScrollArea>
@@ -601,8 +680,8 @@ export default function TaskPage() {
               </div>
             </div>
 
-            <div className="w-[340px] lg:w-[400px] shrink-0 flex flex-col bg-background">
-              <div className="shrink-0 px-3 py-2 border-b bg-card">
+            <div className="w-[300px] lg:w-[340px] shrink-0 flex flex-col bg-background">
+              <div className="shrink-0 px-3 py-1.5 border-b bg-card">
                 <span className="text-xs font-medium text-muted-foreground">Chat</span>
               </div>
               {chatPanel}
@@ -643,8 +722,8 @@ export default function TaskPage() {
               </div>
             </div>
 
-            <div className="w-[340px] lg:w-[400px] shrink-0 flex flex-col bg-background">
-              <div className="shrink-0 px-3 py-2 border-b bg-card">
+            <div className="w-[300px] lg:w-[340px] shrink-0 flex flex-col bg-background">
+              <div className="shrink-0 px-3 py-1.5 border-b bg-card">
                 <span className="text-xs font-medium text-muted-foreground">Chat</span>
               </div>
               {chatPanel}

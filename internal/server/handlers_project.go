@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/cagri/reswe/internal/models"
 	"github.com/cagri/reswe/internal/scanner"
 	"github.com/gofiber/fiber/v3"
 )
@@ -339,4 +340,58 @@ func (s *Server) handlePickDirectory(c fiber.Ctx) error {
 	}
 
 	return writeJSON(c, 200, fiber.Map{"path": dir, "cancelled": false})
+}
+
+// --- Project Files (@-mention) ---
+
+func (s *Server) handleSearchProjectFiles(c fiber.Ctx) error {
+	projectID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid project id")
+	}
+	q := c.Query("q", "")
+	if q == "" {
+		return writeJSON(c, 200, []any{})
+	}
+	files, err := s.store.SearchProjectFiles(projectID, q, 20)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	if files == nil {
+		files = []models.ProjectFile{}
+	}
+	return writeJSON(c, 200, files)
+}
+
+func (s *Server) handleSyncProjectFiles(c fiber.Ctx) error {
+	projectID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid project id")
+	}
+	repos, err := s.store.ListRepos(projectID)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+
+	var allFiles []models.ProjectFile
+	for _, repo := range repos {
+		files, err := s.scanner.ScanTree(repo.Path)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			allFiles = append(allFiles, models.ProjectFile{
+				ProjectID: projectID,
+				RepoID:    repo.ID,
+				RelPath:   f.RelPath,
+				Size:      f.Size,
+				IsDir:     f.IsDir,
+			})
+		}
+	}
+
+	if err := s.store.SyncProjectFiles(projectID, allFiles); err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, fiber.Map{"count": len(allFiles)})
 }

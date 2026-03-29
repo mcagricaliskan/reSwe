@@ -158,11 +158,12 @@ function Sidebar({ open, onClose, collapsed, onToggleCollapse }: { open: boolean
   )
 }
 
-export default function App() {
+function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return localStorage.getItem('sidebar-collapsed') === 'true'
   })
+  const location = useLocation()
 
   const toggleCollapse = () => {
     setSidebarCollapsed(prev => {
@@ -176,33 +177,41 @@ export default function App() {
     return () => wsClient.disconnect()
   }, [])
 
+  const isTaskPage = location.pathname.startsWith('/tasks/')
+
+  return (
+    <div className="flex h-screen overflow-hidden bg-background">
+      <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} collapsed={sidebarCollapsed} onToggleCollapse={toggleCollapse} />
+
+      <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
+        {/* Mobile header */}
+        <header className="flex items-center gap-3 p-3 border-b md:hidden">
+          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setSidebarOpen(true)}>
+            <Menu className="h-5 w-5" />
+          </Button>
+          <span className="font-semibold text-sm">reSwe</span>
+        </header>
+
+        <main className="flex-1 overflow-auto">
+          <div className={cn("w-full", isTaskPage ? "p-2 sm:p-3" : "p-4 sm:p-6 max-w-5xl mx-auto")}>
+            <Routes>
+              <Route path="/" element={<ProjectsPage />} />
+              <Route path="/projects/:id" element={<ProjectPage />} />
+              <Route path="/tasks/:id" element={<TaskPage />} />
+              <Route path="/projects/:id/settings" element={<ProjectSettingsPage />} />
+              <Route path="/settings/exclude-patterns" element={<SettingsPage />} />
+            </Routes>
+          </div>
+        </main>
+      </div>
+    </div>
+  )
+}
+
+export default function App() {
   return (
     <BrowserRouter>
-      <div className="flex h-screen overflow-hidden bg-background">
-        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} collapsed={sidebarCollapsed} onToggleCollapse={toggleCollapse} />
-
-        <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-          {/* Mobile header */}
-          <header className="flex items-center gap-3 p-3 border-b md:hidden">
-            <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => setSidebarOpen(true)}>
-              <Menu className="h-5 w-5" />
-            </Button>
-            <span className="font-semibold text-sm">reSwe</span>
-          </header>
-
-          <main className="flex-1 overflow-auto">
-            <div className="p-4 sm:p-6 max-w-5xl mx-auto w-full">
-              <Routes>
-                <Route path="/" element={<ProjectsPage />} />
-                <Route path="/projects/:id" element={<ProjectPage />} />
-                <Route path="/tasks/:id" element={<TaskPage />} />
-                <Route path="/projects/:id/settings" element={<ProjectSettingsPage />} />
-                <Route path="/settings/exclude-patterns" element={<SettingsPage />} />
-              </Routes>
-            </div>
-          </main>
-        </div>
-      </div>
+      <AppShell />
       <Toaster />
     </BrowserRouter>
   )

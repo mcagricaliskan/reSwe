@@ -89,5 +89,9 @@ type Store interface {
 	// Combined: effective patterns for a project (rules + overrides + custom)
 	GetEffectiveExcludePatterns(projectID int64) ([]string, error)
 
+	// Project Files (for @-mention search)
+	SyncProjectFiles(projectID int64, files []models.ProjectFile) error
+	SearchProjectFiles(projectID int64, query string, limit int) ([]models.ProjectFile, error)
+
 	Close() error
 }

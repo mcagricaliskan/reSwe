@@ -228,6 +228,16 @@ type ProjectExcludeConfig struct {
 	Effective      []string              `json:"effective"` // all enabled patterns merged
 }
 
+// ProjectFile represents a file in a project's codebase (for @-mention search)
+type ProjectFile struct {
+	ID        int64  `json:"id"`
+	ProjectID int64  `json:"project_id"`
+	RepoID    int64  `json:"repo_id"`
+	RelPath   string `json:"rel_path"`
+	Size      int64  `json:"size"`
+	IsDir     bool   `json:"is_dir"`
+}
+
 // Provider config
 type ProviderConfig struct {
 	Type    string `json:"type"`

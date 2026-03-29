@@ -182,6 +182,17 @@ func (s *SQLiteStore) migrate() error {
 		pattern TEXT NOT NULL,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
+
+	CREATE TABLE IF NOT EXISTS project_files (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+		repo_id INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+		rel_path TEXT NOT NULL,
+		size INTEGER DEFAULT 0,
+		is_dir INTEGER DEFAULT 0,
+		UNIQUE(project_id, repo_id, rel_path)
+	);
+	CREATE INDEX IF NOT EXISTS idx_project_files_search ON project_files(project_id, rel_path);
 	`
 	_, err := s.db.Exec(schema)
 	if err != nil {
@@ -191,6 +202,7 @@ func (s *SQLiteStore) migrate() error {
 	// Migrations for existing databases
 	migrations := []string{
 		"ALTER TABLE repos ADD COLUMN type TEXT DEFAULT 'git'",
+		"ALTER TABLE project_files ADD COLUMN is_dir INTEGER DEFAULT 0",
 	}
 	for _, m := range migrations {
 		s.db.Exec(m) // ignore errors — column may already exist
@@ -1170,4 +1182,88 @@ func (s *SQLiteStore) GetEffectiveExcludePatterns(projectID int64) ([]string, er
 	}
 
 	return result, nil
+}
+
+// --- Project Files ---
+
+func (s *SQLiteStore) SyncProjectFiles(projectID int64, files []models.ProjectFile) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.Exec("DELETE FROM project_files WHERE project_id = ?", projectID); err != nil {
+		return err
+	}
+
+	// Bulk insert in batches of 500
+	const batchSize = 500
+	for i := 0; i < len(files); i += batchSize {
+		end := i + batchSize
+		if end > len(files) {
+			end = len(files)
+		}
+		batch := files[i:end]
+
+		var b strings.Builder
+		b.WriteString("INSERT INTO project_files (project_id, repo_id, rel_path, size, is_dir) VALUES ")
+		args := make([]interface{}, 0, len(batch)*5)
+		for j, f := range batch {
+			if j > 0 {
+				b.WriteString(",")
+			}
+			isDir := 0
+			if f.IsDir {
+				isDir = 1
+			}
+			b.WriteString("(?,?,?,?,?)")
+			args = append(args, f.ProjectID, f.RepoID, f.RelPath, f.Size, isDir)
+		}
+		if _, err := tx.Exec(b.String(), args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *SQLiteStore) SearchProjectFiles(projectID int64, query string, limit int) ([]models.ProjectFile, error) {
+	// Build LIKE pattern: "internal/ext/x" → "%internal%/%ext%/%x%"
+	parts := strings.Split(query, "/")
+	var pattern strings.Builder
+	pattern.WriteString("%")
+	for i, part := range parts {
+		if i > 0 {
+			pattern.WriteString("/%")
+		}
+		// Escape LIKE wildcards in user input
+		part = strings.ReplaceAll(part, "%", "\\%")
+		part = strings.ReplaceAll(part, "_", "\\_")
+		pattern.WriteString(part)
+		pattern.WriteString("%")
+	}
+
+	rows, err := s.db.Query(
+		`SELECT id, project_id, repo_id, rel_path, size, is_dir FROM project_files
+		 WHERE project_id = ? AND rel_path LIKE ? ESCAPE '\'
+		 ORDER BY is_dir DESC, rel_path LIMIT ?`,
+		projectID, pattern.String(), limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var files []models.ProjectFile
+	for rows.Next() {
+		var f models.ProjectFile
+		var isDir int
+		if err := rows.Scan(&f.ID, &f.ProjectID, &f.RepoID, &f.RelPath, &f.Size, &isDir); err != nil {
+			return nil, err
+		}
+		f.IsDir = isDir != 0
+		files = append(files, f)
+	}
+	return files, nil
 }

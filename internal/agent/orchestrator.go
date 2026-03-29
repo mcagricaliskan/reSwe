@@ -152,12 +152,36 @@ func (o *Orchestrator) PreviewPrompt(taskID int64, phase string) (*PromptPreview
 	}, nil
 }
 
+// syncProjectFiles scans all repos and updates the project_files table
+func (o *Orchestrator) syncProjectFiles(projectID int64, repos []models.Repo) {
+	var allFiles []models.ProjectFile
+	for _, repo := range repos {
+		files, err := o.scanner.ScanTree(repo.Path)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			allFiles = append(allFiles, models.ProjectFile{
+				ProjectID: projectID,
+				RepoID:    repo.ID,
+				RelPath:   f.RelPath,
+				Size:      f.Size,
+				IsDir:     f.IsDir,
+			})
+		}
+	}
+	o.store.SyncProjectFiles(projectID, allFiles)
+}
+
 // initRun is shared setup for all agent phases
 func (o *Orchestrator) initRun(taskID int64, phase string, cfg RunConfig) (*models.Task, []models.Repo, provider.Provider, *ToolSet, string, error) {
 	task, repos, excludePatterns, err := o.getTaskWithRepos(taskID)
 	if err != nil {
 		return nil, nil, nil, nil, "", err
 	}
+
+	// Sync project file index for @-mention search
+	o.syncProjectFiles(task.ProjectID, repos)
 
 	p, err := o.getProvider(cfg.Provider)
 	if err != nil {

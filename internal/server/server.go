@@ -155,6 +155,10 @@ func (s *Server) setupRoutes() {
 	api.Put("/exclude-rules/:id", s.handleUpdateExcludeRule)
 	api.Delete("/exclude-rules/:id", s.handleDeleteExcludeRule)
 
+	// Project files (@-mention search)
+	api.Get("/projects/:id/files", s.handleSearchProjectFiles)
+	api.Post("/projects/:id/sync-files", s.handleSyncProjectFiles)
+
 	// Project exclude config
 	api.Get("/projects/:id/exclude-config", s.handleGetProjectExcludeConfig)
 	api.Post("/projects/:id/exclude-override", s.handleSetProjectExcludeOverride)
