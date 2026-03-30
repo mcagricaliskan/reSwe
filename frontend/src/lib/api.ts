@@ -47,6 +47,21 @@ export interface Task {
   updated_at: string
   clarifications?: Clarification[]
   executions?: Execution[]
+  todos?: PlanTodo[]
+}
+
+export interface PlanTodo {
+  id: number
+  task_id: number
+  run_id: number
+  order_index: number
+  title: string
+  description: string
+  status: string // pending, in_progress, done, failed
+  depends_on: number[]
+  result: string
+  created_at: string
+  updated_at: string
 }
 
 export interface Clarification {
@@ -255,6 +270,31 @@ export interface TaskMessage {
   created_at: string
 }
 
+// Pending Changes (diff review)
+export interface PendingChange {
+  id: string
+  run_id: number
+  todo_id: number
+  task_id: number
+  tool: string
+  file_path: string
+  rel_path: string
+  old_content: string
+  new_content: string
+  diff: string
+  status: string // pending, accepted, rejected
+  reject_reason: string
+  created_at: string
+}
+
+export const acceptChange = (changeId: string) =>
+  request(`/changes/${changeId}/accept`, { method: 'POST' })
+export const rejectChange = (changeId: string, reason = '') =>
+  request(`/changes/${changeId}/reject`, { method: 'POST', body: JSON.stringify({ reason }) })
+export const listPendingChanges = (taskId: number | string) =>
+  request<PendingChange[]>(`/tasks/${taskId}/pending-changes`)
+
+// Chat
 export const taskChat = (taskId: number | string, message: string) =>
   request(`/tasks/${taskId}/chat`, { method: 'POST', body: JSON.stringify({ message }) })
 export const listTaskMessages = (taskId: number | string) =>
@@ -355,6 +395,22 @@ export const getLatestRun = (taskId: number | string) =>
   request<PersistedAgentRun | null>(`/tasks/${taskId}/runs/latest`)
 export const getAgentRun = (runId: number) =>
   request<PersistedAgentRun>(`/runs/${runId}`)
+
+// Timeline
+export interface TimelineEvent {
+  id: string
+  type: string
+  title: string
+  description?: string
+  status?: string
+  run_id?: number
+  todo_id?: number
+  change_id?: string
+  metadata?: Record<string, unknown>
+  created_at: string
+}
+export const getTimeline = (taskId: number | string) =>
+  request<TimelineEvent[]>(`/tasks/${taskId}/timeline`)
 
 // Project Files (@-mention)
 export interface ProjectFile {

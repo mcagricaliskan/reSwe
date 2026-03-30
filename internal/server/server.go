@@ -135,6 +135,14 @@ func (s *Server) setupRoutes() {
 	api.Put("/todos/:todoId", s.handleUpdateTodo)
 	api.Post("/tasks/:taskId/execute-todos", s.handleExecuteTodos)
 
+	// Timeline
+	api.Get("/tasks/:taskId/timeline", s.handleGetTimeline)
+
+	// Change approval (diff review)
+	api.Post("/changes/:changeId/accept", s.handleAcceptChange)
+	api.Post("/changes/:changeId/reject", s.handleRejectChange)
+	api.Get("/tasks/:taskId/pending-changes", s.handleListPendingChanges)
+
 	// General task chat
 	api.Post("/tasks/:taskId/chat", s.handleTaskChat)
 	api.Get("/tasks/:taskId/chat/messages", s.handleListTaskMessages)

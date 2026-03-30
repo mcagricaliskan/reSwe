@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -432,6 +433,190 @@ func (s *Server) handleExecuteTodos(c fiber.Ctx) error {
 		}
 	}()
 	return writeJSON(c, 202, fiber.Map{"status": "started", "phase": "execute-todo"})
+}
+
+func (s *Server) handleGetTimeline(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+
+	var events []models.TimelineEvent
+
+	// Agent runs → plan/execute/chat events
+	runs, _ := s.store.ListAgentRuns(taskID)
+	for _, run := range runs {
+		ev := models.TimelineEvent{
+			ID:        fmt.Sprintf("run-%d", run.ID),
+			RunID:     run.ID,
+			Status:    run.Status,
+			CreatedAt: run.CreatedAt,
+		}
+
+		switch run.Phase {
+		case "plan":
+			if run.Status == "completed" {
+				// Check if this was first plan or revision
+				firstPlan := true
+				for _, prev := range runs {
+					if prev.Phase == "plan" && prev.Status == "completed" && prev.CreatedAt.Before(run.CreatedAt) {
+						firstPlan = false
+						break
+					}
+				}
+				if firstPlan {
+					ev.Type = "plan_created"
+					ev.Title = "Plan created"
+				} else {
+					ev.Type = "plan_revised"
+					ev.Title = "Plan revised"
+				}
+				ev.Metadata = map[string]interface{}{
+					"step_count": run.StepCount,
+					"duration_ms": run.DurationMs,
+				}
+			} else if run.Status == "waiting" {
+				ev.Type = "plan_waiting"
+				ev.Title = "Agent waiting for input"
+			} else if run.Status == "error" {
+				ev.Type = "plan_error"
+				ev.Title = "Planning failed"
+				ev.Description = run.Error
+			} else {
+				continue // skip running/resumed
+			}
+		case "execute-todo":
+			if run.Status == "completed" {
+				ev.Type = "todo_executed"
+				ev.Title = "Step executed"
+				ev.Description = run.FinalResult
+				if len(ev.Description) > 100 {
+					ev.Description = ev.Description[:100] + "..."
+				}
+			} else if run.Status == "waiting" {
+				ev.Type = "change_pending"
+				ev.Title = "Change waiting for approval"
+			} else if run.Status == "error" {
+				ev.Type = "todo_error"
+				ev.Title = "Step failed"
+				ev.Description = run.Error
+			} else {
+				continue
+			}
+			ev.Metadata = map[string]interface{}{"step_count": run.StepCount, "duration_ms": run.DurationMs}
+		case "execute":
+			if run.Status == "completed" {
+				ev.Type = "execution_completed"
+				ev.Title = "Execution completed"
+			} else if run.Status == "error" {
+				ev.Type = "execution_error"
+				ev.Title = "Execution failed"
+				ev.Description = run.Error
+			} else {
+				continue
+			}
+		case "chat":
+			if run.Status == "completed" {
+				ev.Type = "chat"
+				ev.Title = "Chat message"
+				ev.Metadata = map[string]interface{}{"step_count": run.StepCount}
+			} else {
+				continue
+			}
+		default:
+			continue
+		}
+
+		events = append(events, ev)
+	}
+
+	// Pending changes → accepted/rejected events
+	changes, _ := s.store.ListPendingChanges(taskID)
+	for _, ch := range changes {
+		if ch.Status == "accepted" {
+			events = append(events, models.TimelineEvent{
+				ID:        "change-" + ch.ID,
+				Type:      "change_accepted",
+				Title:     "Change accepted",
+				ChangeID:  ch.ID,
+				CreatedAt: ch.CreatedAt,
+				Metadata:  map[string]interface{}{"file": ch.RelPath, "tool": ch.Tool},
+			})
+		} else if ch.Status == "rejected" {
+			events = append(events, models.TimelineEvent{
+				ID:          "change-" + ch.ID,
+				Type:        "change_rejected",
+				Title:       "Change rejected",
+				Description: ch.RejectReason,
+				ChangeID:    ch.ID,
+				CreatedAt:   ch.CreatedAt,
+				Metadata:    map[string]interface{}{"file": ch.RelPath, "tool": ch.Tool},
+			})
+		}
+	}
+
+	// Sort by time descending (most recent first)
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].CreatedAt.After(events[j].CreatedAt)
+	})
+
+	return writeJSON(c, 200, events)
+}
+
+func (s *Server) handleAcceptChange(c fiber.Ctx) error {
+	changeID := c.Params("changeId")
+
+	// Get the change to find the task
+	change, err := s.store.GetPendingChange(changeID)
+	if err != nil {
+		return writeError(c, 404, "change not found")
+	}
+
+	cfg := agent.RunConfig{Provider: "ollama", Model: "qwen3.5:27b"}
+
+	go func() {
+		if err := s.orchestrator.AcceptChange(change.TaskID, changeID, cfg); err != nil {
+			s.hub.Broadcast(models_ws_error(change.TaskID, err.Error()))
+		}
+	}()
+
+	return writeJSON(c, 202, fiber.Map{"status": "accepted"})
+}
+
+func (s *Server) handleRejectChange(c fiber.Ctx) error {
+	changeID := c.Params("changeId")
+
+	change, err := s.store.GetPendingChange(changeID)
+	if err != nil {
+		return writeError(c, 404, "change not found")
+	}
+
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	c.Bind().JSON(&req)
+
+	cfg := agent.RunConfig{Provider: "ollama", Model: "qwen3.5:27b"}
+
+	go func() {
+		if err := s.orchestrator.RejectChange(change.TaskID, changeID, req.Reason, cfg); err != nil {
+			s.hub.Broadcast(models_ws_error(change.TaskID, err.Error()))
+		}
+	}()
+
+	return writeJSON(c, 202, fiber.Map{"status": "rejected"})
+}
+
+func (s *Server) handleListPendingChanges(c fiber.Ctx) error {
+	taskID, err := strconv.ParseInt(c.Params("taskId"), 10, 64)
+	if err != nil {
+		return writeError(c, 400, "invalid task id")
+	}
+	changes, err := s.store.ListPendingChanges(taskID)
+	if err != nil {
+		return writeError(c, 500, err.Error())
+	}
+	return writeJSON(c, 200, changes)
 }
 
 func (s *Server) handleAnswer(c fiber.Ctx) error {

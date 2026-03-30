@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -218,14 +219,23 @@ func (o *Orchestrator) initRun(taskID int64, phase string, cfg RunConfig) (*mode
 }
 
 // loadHistory loads the persisted task conversation as ChatMessages (unified for all phases)
+// Replaces __PLAN_COMPLETED__ markers with actual plan content for LLM context
 func (o *Orchestrator) loadHistory(taskID int64) []models.ChatMessage {
 	msgs, err := o.store.ListTaskMessages(taskID)
 	if err != nil {
 		return nil
 	}
+
+	// Load the task to get the current plan for marker replacement
+	task, _ := o.store.GetTask(taskID)
+
 	var history []models.ChatMessage
 	for _, m := range msgs {
-		history = append(history, models.ChatMessage{Role: m.Role, Content: m.Content})
+		content := m.Content
+		if content == "__PLAN_COMPLETED__" && task != nil && task.ImplementationPlan != "" {
+			content = "I've created the implementation plan:\n\n" + task.ImplementationPlan
+		}
+		history = append(history, models.ChatMessage{Role: m.Role, Content: content})
 	}
 	return history
 }
@@ -340,9 +350,9 @@ func (o *Orchestrator) Plan(taskID int64, cfg RunConfig) error {
 	userMsg := BuildUserPrompt("plan", task, "")
 	result := runPlan(ctx, p, cfg.Model, task, tools, sysPrompt, nil, "", onStep, onStream)
 
-	// Save conversation turn if agent produced output
+	// Save conversation turn — use marker instead of full plan (plan is in task.ImplementationPlan)
 	if result.FinalResult != "" {
-		o.saveTurn(taskID, userMsg, result.FinalResult)
+		o.saveTurn(taskID, userMsg, "__PLAN_COMPLETED__")
 	}
 
 	return o.handleLoopResult(taskID, result, dbRun, task, "plan")
@@ -379,7 +389,7 @@ func (o *Orchestrator) PlanChat(taskID int64, userMessage string, cfg RunConfig)
 				savedUserMessage += fmt.Sprintf("\n\n## Additional User Instructions\n%s", userMessage)
 			}
 		}
-		o.saveTurn(taskID, savedUserMessage, result.FinalResult)
+		o.saveTurn(taskID, savedUserMessage, "__PLAN_COMPLETED__")
 		task.ImplementationPlan = result.FinalResult
 	}
 
@@ -575,7 +585,7 @@ func parsePlanTodos(raw string) (string, []models.PlanTodo) {
 	return desc, todos
 }
 
-// ExecuteTodos runs TODO items one by one in dependency order
+// ExecuteTodos runs TODO items one by one in dependency order, with diff review
 func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 	task, _, p, tools, _, err := o.initRun(taskID, "execute-todo", cfg)
 	if err != nil {
@@ -587,6 +597,10 @@ func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 		return fmt.Errorf("no TODOs found for task %d", taskID)
 	}
 
+	// Enable review mode — changes pause for approval
+	tools.ReviewMode = true
+	tools.TaskID = taskID
+
 	task.Status = models.TaskStatusExecuting
 	o.store.UpdateTask(task)
 	o.emit(taskID, models.WSTypeTaskUpdate, map[string]interface{}{"status": task.Status})
@@ -594,18 +608,17 @@ func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 	sysPrompt := DefaultSystemPrompts["execute-todo"]
 
 	for {
-		// Find next executable TODO
 		next := findNextTodo(todos)
 		if next == nil {
 			break
 		}
 
-		// Mark in_progress
 		next.Status = "in_progress"
 		o.store.UpdatePlanTodo(next)
 		o.emit(taskID, models.WSTypeTodoUpdate, next)
 
-		// Create agent run for this TODO
+		tools.CurrentTodoID = next.ID
+
 		ctx, memRun := o.Tracker.Start(taskID, "execute-todo", cfg.Provider, cfg.Model)
 		dbRun, err := o.store.CreateAgentRun(taskID, "execute-todo", cfg.Provider, cfg.Model, sysPrompt)
 		if err != nil {
@@ -616,11 +629,41 @@ func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 			break
 		}
 
+		tools.RunID = dbRun.ID
 		onStep, onStream := o.makeStepCallback(taskID, "execute-todo", memRun, dbRun)
 
-		// Build context: this TODO + plan + previous results
 		prevResults := buildPreviousResults(todos)
 		result := runTodoExecution(ctx, p, cfg.Model, task, next, prevResults, tools, sysPrompt, onStep, onStream)
+
+		// Handle change_proposed pause
+		if result.Status == "waiting_for_user" && tools.PendingChange != nil {
+			change := tools.PendingChange
+			tools.PendingChange = nil
+
+			// Save pending change to DB
+			o.store.CreatePendingChange(change)
+
+			// Save paused state for resume
+			msgJSON, _ := json.Marshal(result.Messages)
+			dbRun.Status = "waiting"
+			dbRun.PausedMessages = string(msgJSON)
+			dbRun.StepCount = result.StepCount
+			o.store.UpdateAgentRun(dbRun)
+
+			o.Tracker.Complete(taskID, nil)
+
+			// Emit change_proposed to frontend
+			o.emit(taskID, models.WSTypeChangeProposed, map[string]interface{}{
+				"change_id": change.ID,
+				"todo_id":   change.TodoID,
+				"tool":      change.Tool,
+				"file_path": change.RelPath,
+				"diff":      change.Diff,
+			})
+
+			// Execution pauses here — will be resumed by AcceptChange/RejectChange
+			return nil
+		}
 
 		o.Tracker.Complete(taskID, result.Error)
 		o.completeRun(dbRun, result.FinalResult, result.Error)
@@ -644,11 +687,10 @@ func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 		o.store.UpdatePlanTodo(next)
 		o.emit(taskID, models.WSTypeTodoUpdate, next)
 
-		// Refresh todos from DB to get latest statuses
 		todos, _ = o.store.ListPlanTodos(taskID)
 	}
 
-	// Check if all done
+	// Check completion
 	todos, _ = o.store.ListPlanTodos(taskID)
 	allDone := true
 	for _, t := range todos {
@@ -666,6 +708,193 @@ func (o *Orchestrator) ExecuteTodos(taskID int64, cfg RunConfig) error {
 	}
 	o.emit(taskID, models.WSTypeAgentDone, map[string]interface{}{"phase": "execute-todo"})
 	return nil
+}
+
+// AcceptChange applies a pending change and resumes execution
+func (o *Orchestrator) AcceptChange(taskID int64, changeID string, cfg RunConfig) error {
+	change, err := o.store.GetPendingChange(changeID)
+	if err != nil {
+		return fmt.Errorf("change not found: %w", err)
+	}
+
+	// Apply the file change
+	if err := os.WriteFile(change.FilePath, []byte(change.NewContent), 0644); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	change.Status = "accepted"
+	o.store.UpdatePendingChange(change)
+	o.emit(taskID, models.WSTypeChangeAccepted, map[string]interface{}{"change_id": changeID})
+
+	// Find the paused run and resume
+	dbRun, err := o.store.GetLatestAgentRun(taskID)
+	if err != nil || dbRun.Status != "waiting" {
+		// No paused run — just continue execution from scratch
+		go func() {
+			o.ExecuteTodos(taskID, cfg)
+		}()
+		return nil
+	}
+
+	// Resume the agent loop with "accepted" observation
+	go func() {
+		o.resumeAfterChange(taskID, dbRun, "Change accepted and applied to "+change.RelPath, cfg)
+	}()
+	return nil
+}
+
+// RejectChange rejects a pending change and resumes execution with feedback
+func (o *Orchestrator) RejectChange(taskID int64, changeID string, reason string, cfg RunConfig) error {
+	change, err := o.store.GetPendingChange(changeID)
+	if err != nil {
+		return fmt.Errorf("change not found: %w", err)
+	}
+
+	change.Status = "rejected"
+	change.RejectReason = reason
+	o.store.UpdatePendingChange(change)
+	o.emit(taskID, models.WSTypeChangeRejected, map[string]interface{}{"change_id": changeID, "reason": reason})
+
+	dbRun, err := o.store.GetLatestAgentRun(taskID)
+	if err != nil || dbRun.Status != "waiting" {
+		return nil
+	}
+
+	observation := "User REJECTED this change for " + change.RelPath
+	if reason != "" {
+		observation += ". Reason: " + reason
+	}
+	observation += "\nPlease adjust and try again, or move on."
+
+	go func() {
+		o.resumeAfterChange(taskID, dbRun, observation, cfg)
+	}()
+	return nil
+}
+
+// resumeAfterChange continues the execution loop after a change was accepted/rejected
+func (o *Orchestrator) resumeAfterChange(taskID int64, pausedRun *models.AgentRun, observation string, cfg RunConfig) {
+	task, _, p, tools, _, err := o.initRun(taskID, "execute-todo", cfg)
+	if err != nil {
+		return
+	}
+
+	// Reload paused messages
+	var pausedMessages []models.ChatMessage
+	if err := json.Unmarshal([]byte(pausedRun.PausedMessages), &pausedMessages); err != nil {
+		return
+	}
+
+	// Append the observation (accepted/rejected)
+	pausedMessages = append(pausedMessages, models.ChatMessage{
+		Role:    "user",
+		Content: fmt.Sprintf("OBSERVATION:\n%s\n\nContinue with your next THINK and ACTION.", observation),
+	})
+
+	// Enable review mode
+	tools.ReviewMode = true
+	tools.TaskID = taskID
+
+	// Find the current TODO
+	todos, _ := o.store.ListPlanTodos(taskID)
+	var currentTodo *models.PlanTodo
+	for i, t := range todos {
+		if t.Status == "in_progress" {
+			currentTodo = &todos[i]
+			break
+		}
+	}
+	if currentTodo != nil {
+		tools.CurrentTodoID = currentTodo.ID
+	}
+
+	// Mark old run as resumed
+	pausedRun.Status = "resumed"
+	o.store.UpdateAgentRun(pausedRun)
+
+	// Create new run for the resumed session
+	sysPrompt := DefaultSystemPrompts["execute-todo"]
+	ctx, memRun := o.Tracker.Start(taskID, "execute-todo", cfg.Provider, cfg.Model)
+	dbRun, err := o.store.CreateAgentRun(taskID, "execute-todo", cfg.Provider, cfg.Model, sysPrompt)
+	if err != nil {
+		return
+	}
+
+	tools.RunID = dbRun.ID
+	onStep, onStream := o.makeStepCallback(taskID, "execute-todo", memRun, dbRun)
+
+	o.emit(taskID, models.WSTypeTaskUpdate, map[string]interface{}{"status": task.Status, "phase": "execute-todo", "run_id": dbRun.ID})
+
+	// Resume the loop
+	result := RunLoop(ctx, LoopConfig{
+		Provider:     p,
+		Model:        cfg.Model,
+		SystemPrompt: sysPrompt,
+		History:      pausedMessages,
+		Tools:        tools,
+		OnStep:       onStep,
+		OnStream:     onStream,
+	})
+
+	// Handle result — may pause again for another change
+	if result.Status == "waiting_for_user" && tools.PendingChange != nil {
+		change := tools.PendingChange
+		tools.PendingChange = nil
+		o.store.CreatePendingChange(change)
+
+		msgJSON, _ := json.Marshal(result.Messages)
+		dbRun.Status = "waiting"
+		dbRun.PausedMessages = string(msgJSON)
+		dbRun.StepCount = result.StepCount
+		o.store.UpdateAgentRun(dbRun)
+		o.Tracker.Complete(taskID, nil)
+
+		o.emit(taskID, models.WSTypeChangeProposed, map[string]interface{}{
+			"change_id": change.ID,
+			"todo_id":   change.TodoID,
+			"tool":      change.Tool,
+			"file_path": change.RelPath,
+			"diff":      change.Diff,
+		})
+		return
+	}
+
+	o.Tracker.Complete(taskID, result.Error)
+	o.completeRun(dbRun, result.FinalResult, result.Error)
+
+	// Mark the current TODO based on result
+	if currentTodo != nil {
+		if result.Status == "done" {
+			currentTodo.Status = "done"
+			currentTodo.Result = result.FinalResult
+		} else if result.Error != nil {
+			currentTodo.Status = "failed"
+			currentTodo.Result = result.Error.Error()
+		}
+		o.store.UpdatePlanTodo(currentTodo)
+		o.emit(taskID, models.WSTypeTodoUpdate, currentTodo)
+	}
+
+	// Continue with remaining TODOs
+	todos, _ = o.store.ListPlanTodos(taskID)
+	hasMore := findNextTodo(todos) != nil
+	if hasMore {
+		o.ExecuteTodos(taskID, cfg)
+	} else {
+		allDone := true
+		for _, t := range todos {
+			if t.Status != "done" {
+				allDone = false
+			}
+		}
+		if allDone {
+			task.Status = models.TaskStatusReview
+		} else {
+			task.Status = models.TaskStatusOpen
+		}
+		o.store.UpdateTask(task)
+		o.emit(taskID, models.WSTypeAgentDone, map[string]interface{}{"phase": "execute-todo"})
+	}
 }
 
 // findNextTodo returns the first pending TODO whose dependencies are all done

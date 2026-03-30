@@ -131,6 +131,7 @@ interface ChatPanelProps {
   projectId?: number
   emptyMessage?: string
   extraActions?: React.ReactNode
+  renderAfterSteps?: () => React.ReactNode
 }
 
 export function ChatPanel({
@@ -152,6 +153,7 @@ export function ChatPanel({
   projectId,
   emptyMessage = 'Send a message to start chatting.',
   extraActions,
+  renderAfterSteps,
 }: ChatPanelProps) {
   const chatEndRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -236,32 +238,47 @@ export function ChatPanel({
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <ScrollArea className="flex-1">
+    <div className="flex flex-col h-full min-h-0">
+      <ScrollArea className="flex-1 min-h-0">
         <div className="space-y-2.5 p-2.5">
           {messages.length === 0 && !activePhase && (
             <div className="text-center py-6 text-muted-foreground">
               <p className="text-sm">{emptyMessage}</p>
             </div>
           )}
-          {messages.map(msg => (
-            <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${
-                msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-card border'
-              }`}>
-                {msg.role === 'user' ? (
-                  <p className="whitespace-pre-wrap">{msg.content}</p>
-                ) : (
-                  <div className="prose prose-sm max-w-none dark:prose-invert">
-                    <ReactMarkdown>{msg.content}</ReactMarkdown>
+          {messages.map(msg => {
+            // Plan completed marker — show compact card instead of full plan text
+            if (msg.role === 'assistant' && msg.content === '__PLAN_COMPLETED__') {
+              return (
+                <div key={msg.id} className="flex justify-start">
+                  <div className="rounded-lg text-sm bg-emerald-500/10 border border-emerald-500/20 px-3 py-2 flex items-center gap-2">
+                    <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                    <span className="text-emerald-400 font-medium text-xs">Plan created</span>
+                    <span className="text-[10px] text-muted-foreground">{formatTime(msg.created_at)}</span>
                   </div>
-                )}
-                <p className={`text-[10px] mt-1 ${msg.role === 'user' ? 'text-primary-foreground/50' : 'text-muted-foreground'}`}>
-                  {formatTime(msg.created_at)}
-                </p>
+                </div>
+              )
+            }
+
+            return (
+              <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className={`max-w-[90%] rounded-lg px-3 py-2 text-sm ${
+                  msg.role === 'user' ? 'bg-primary text-primary-foreground' : 'bg-card border'
+                }`}>
+                  {msg.role === 'user' ? (
+                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                  ) : (
+                    <div className="prose prose-sm max-w-none dark:prose-invert">
+                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                    </div>
+                  )}
+                  <p className={`text-[10px] mt-1 ${msg.role === 'user' ? 'text-primary-foreground/50' : 'text-muted-foreground'}`}>
+                    {formatTime(msg.created_at)}
+                  </p>
+                </div>
               </div>
-            </div>
-          ))}
+            )
+          })}
           {agentSteps.map((step, index) => (
             <CollapsibleStepMessage key={`step-${index}`} step={step} index={index} />
           ))}
@@ -330,6 +347,9 @@ export function ChatPanel({
               </Button>
             </div>
           )}
+
+          {/* Extra content (e.g. diff viewers) */}
+          {renderAfterSteps?.()}
 
           <div ref={chatEndRef} />
         </div>

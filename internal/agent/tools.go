@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cagri/reswe/internal/models"
 	"github.com/cagri/reswe/internal/scanner"
@@ -36,10 +37,16 @@ type ToolResult struct {
 type ToolSet struct {
 	scanner         *scanner.Scanner
 	repos           []models.Repo
-	excludePatterns []string // configurable patterns from DB
-	// For ask_user: pending questions get emitted, answers come back later
+	excludePatterns []string
+	// For ask_user: pending questions
 	pendingQuestions []string
 	userAnswers     map[string]string
+	// Review mode: when true, write/edit operations produce diffs and pause instead of applying
+	ReviewMode    bool
+	PendingChange *models.PendingChange // the last proposed change (for approval flow)
+	CurrentTodoID int64                  // which TODO is being executed (for linking changes)
+	TaskID        int64                  // for linking pending changes
+	RunID         int64                  // for linking pending changes
 }
 
 func NewToolSet(sc *scanner.Scanner, repos []models.Repo, excludePatterns []string) *ToolSet {
@@ -452,6 +459,35 @@ func (ts *ToolSet) writeFile(path, content string) ToolResult {
 		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Error creating directory: %v", err)}
 	}
 
+	// ReviewMode: propose change instead of applying
+	if ts.ReviewMode {
+		oldContent := ""
+		if data, err := os.ReadFile(resolved); err == nil {
+			oldContent = string(data)
+		}
+		diff := UnifiedDiff(oldContent, content, path)
+		ts.PendingChange = &models.PendingChange{
+			ID:         fmt.Sprintf("%d-%d", ts.TaskID, time.Now().UnixNano()),
+			RunID:      ts.RunID,
+			TodoID:     ts.CurrentTodoID,
+			TaskID:     ts.TaskID,
+			Tool:       "write_file",
+			FilePath:   resolved,
+			RelPath:    path,
+			OldContent: oldContent,
+			NewContent: content,
+			Diff:       diff,
+			Status:     "pending",
+			CreatedAt:  time.Now(),
+		}
+		return ToolResult{
+			Tool:    "write_file",
+			Success: true,
+			Output:  fmt.Sprintf("Change proposed for %s. Waiting for user approval.\n\n%s", path, diff),
+			Pause:   true,
+		}
+	}
+
 	if err := os.WriteFile(resolved, []byte(content), 0644); err != nil {
 		return ToolResult{Tool: "write_file", Success: false, Output: fmt.Sprintf("Error writing %s: %v", path, err)}
 	}
@@ -525,6 +561,31 @@ func (ts *ToolSet) editFile(path, oldContent, newContent string) ToolResult {
 
 	// Exactly one match — apply the replacement
 	newFile := strings.Replace(fileContent, oldContent, newContent, 1)
+
+	// ReviewMode: propose change instead of applying
+	if ts.ReviewMode {
+		diff := UnifiedDiff(fileContent, newFile, path)
+		ts.PendingChange = &models.PendingChange{
+			ID:         fmt.Sprintf("%d-%d", ts.TaskID, time.Now().UnixNano()),
+			RunID:      ts.RunID,
+			TodoID:     ts.CurrentTodoID,
+			TaskID:     ts.TaskID,
+			Tool:       "edit_file",
+			FilePath:   resolved,
+			RelPath:    path,
+			OldContent: fileContent,
+			NewContent: newFile,
+			Diff:       diff,
+			Status:     "pending",
+			CreatedAt:  time.Now(),
+		}
+		return ToolResult{
+			Tool:    "edit_file",
+			Success: true,
+			Output:  fmt.Sprintf("Change proposed for %s. Waiting for user approval.\n\n%s", path, diff),
+			Pause:   true,
+		}
+	}
 
 	if err := os.WriteFile(resolved, []byte(newFile), 0644); err != nil {
 		return ToolResult{Tool: "edit_file", Success: false, Output: fmt.Sprintf("Error writing %s: %v", path, err)}

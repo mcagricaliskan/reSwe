@@ -152,6 +152,22 @@ func (s *SQLiteStore) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);
 
+	CREATE TABLE IF NOT EXISTS pending_changes (
+		id TEXT PRIMARY KEY,
+		run_id INTEGER NOT NULL,
+		todo_id INTEGER DEFAULT 0,
+		task_id INTEGER NOT NULL,
+		tool TEXT NOT NULL,
+		file_path TEXT NOT NULL,
+		rel_path TEXT NOT NULL,
+		old_content TEXT DEFAULT '',
+		new_content TEXT DEFAULT '',
+		diff TEXT DEFAULT '',
+		status TEXT DEFAULT 'pending',
+		reject_reason TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	CREATE TABLE IF NOT EXISTS plan_todos (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1096,6 +1112,59 @@ func (s *SQLiteStore) ListPendingQuestions(taskID int64) ([]models.AgentQuestion
 		qs = append(qs, q)
 	}
 	return qs, nil
+}
+
+// --- Pending Changes ---
+
+func (s *SQLiteStore) CreatePendingChange(change *models.PendingChange) error {
+	_, err := s.db.Exec(
+		`INSERT INTO pending_changes (id, run_id, todo_id, task_id, tool, file_path, rel_path, old_content, new_content, diff, status, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		change.ID, change.RunID, change.TodoID, change.TaskID, change.Tool,
+		change.FilePath, change.RelPath, change.OldContent, change.NewContent,
+		change.Diff, change.Status, change.CreatedAt,
+	)
+	return err
+}
+
+func (s *SQLiteStore) GetPendingChange(id string) (*models.PendingChange, error) {
+	c := &models.PendingChange{}
+	err := s.db.QueryRow(
+		`SELECT id, run_id, todo_id, task_id, tool, file_path, rel_path, old_content, new_content, diff, status, reject_reason, created_at
+		 FROM pending_changes WHERE id = ?`, id,
+	).Scan(&c.ID, &c.RunID, &c.TodoID, &c.TaskID, &c.Tool, &c.FilePath, &c.RelPath,
+		&c.OldContent, &c.NewContent, &c.Diff, &c.Status, &c.RejectReason, &c.CreatedAt)
+	return c, err
+}
+
+func (s *SQLiteStore) UpdatePendingChange(change *models.PendingChange) error {
+	_, err := s.db.Exec(
+		`UPDATE pending_changes SET status = ?, reject_reason = ? WHERE id = ?`,
+		change.Status, change.RejectReason, change.ID,
+	)
+	return err
+}
+
+func (s *SQLiteStore) ListPendingChanges(taskID int64) ([]models.PendingChange, error) {
+	rows, err := s.db.Query(
+		`SELECT id, run_id, todo_id, task_id, tool, file_path, rel_path, old_content, new_content, diff, status, reject_reason, created_at
+		 FROM pending_changes WHERE task_id = ? ORDER BY created_at`, taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var changes []models.PendingChange
+	for rows.Next() {
+		var c models.PendingChange
+		if err := rows.Scan(&c.ID, &c.RunID, &c.TodoID, &c.TaskID, &c.Tool, &c.FilePath, &c.RelPath,
+			&c.OldContent, &c.NewContent, &c.Diff, &c.Status, &c.RejectReason, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		changes = append(changes, c)
+	}
+	return changes, nil
 }
 
 // --- Plan TODOs ---

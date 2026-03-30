@@ -121,11 +121,28 @@ type PlanTodo struct {
 	OrderIndex  int       `json:"order_index"`
 	Title       string    `json:"title"`
 	Description string    `json:"description"`
-	Status      string    `json:"status"` // pending, in_progress, done, failed
+	Status      string    `json:"status"` // pending, in_progress, done, failed, cancelled, invalidated
 	DependsOn   []int64   `json:"depends_on"`
 	Result      string    `json:"result"`
 	CreatedAt   time.Time `json:"created_at"`
 	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+// PendingChange represents a file change waiting for user approval
+type PendingChange struct {
+	ID           string    `json:"id"`
+	RunID        int64     `json:"run_id"`
+	TodoID       int64     `json:"todo_id"`
+	TaskID       int64     `json:"task_id"`
+	Tool         string    `json:"tool"`         // "write_file" or "edit_file"
+	FilePath     string    `json:"file_path"`    // absolute path
+	RelPath      string    `json:"rel_path"`     // repo-prefixed display path
+	OldContent   string    `json:"old_content"`
+	NewContent   string    `json:"new_content"`
+	Diff         string    `json:"diff"`         // unified diff
+	Status       string    `json:"status"`       // pending, accepted, rejected
+	RejectReason string    `json:"reject_reason"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type Execution struct {
@@ -138,6 +155,20 @@ type Execution struct {
 	Log          string    `json:"log,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+// TimelineEvent represents one activity entry in the task timeline
+type TimelineEvent struct {
+	ID          string      `json:"id"`
+	Type        string      `json:"type"`    // plan_created, plan_revised, execution_started, execution_completed, todo_done, change_accepted, change_rejected, chat
+	Title       string      `json:"title"`
+	Description string      `json:"description,omitempty"`
+	Status      string      `json:"status,omitempty"`
+	RunID       int64       `json:"run_id,omitempty"`
+	TodoID      int64       `json:"todo_id,omitempty"`
+	ChangeID    string      `json:"change_id,omitempty"`
+	Metadata    interface{} `json:"metadata,omitempty"` // extra data (step count, diff count, etc.)
+	CreatedAt   time.Time   `json:"created_at"`
 }
 
 // Agent run represents a single agent execution (persisted)
@@ -190,7 +221,10 @@ const (
 	WSTypeAgentDone    WSMessageType = "agent_done"
 	WSTypeAgentError   WSMessageType = "agent_error"
 	WSTypeAgentWaiting WSMessageType = "agent_waiting"
-	WSTypeTodoUpdate   WSMessageType = "todo_update"
+	WSTypeTodoUpdate      WSMessageType = "todo_update"
+	WSTypeChangeProposed  WSMessageType = "change_proposed"
+	WSTypeChangeAccepted  WSMessageType = "change_accepted"
+	WSTypeChangeRejected  WSMessageType = "change_rejected"
 	WSTypeTaskUpdate  WSMessageType = "task_update"
 	WSTypeClarify     WSMessageType = "clarify"
 )

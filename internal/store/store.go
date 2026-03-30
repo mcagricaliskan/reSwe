@@ -65,6 +65,12 @@ type Store interface {
 	CreateAgentStep(runID int64, step *models.AgentStep) (*models.AgentStep, error)
 	ListAgentSteps(runID int64) ([]models.AgentStep, error)
 
+	// Pending Changes (diff approval)
+	CreatePendingChange(change *models.PendingChange) error
+	GetPendingChange(id string) (*models.PendingChange, error)
+	UpdatePendingChange(change *models.PendingChange) error
+	ListPendingChanges(taskID int64) ([]models.PendingChange, error)
+
 	// Plan TODOs
 	CreatePlanTodo(todo *models.PlanTodo) (*models.PlanTodo, error)
 	ListPlanTodos(taskID int64) ([]models.PlanTodo, error)

@@ -9,11 +9,16 @@ import (
 )
 
 func runChat(ctx context.Context, p provider.Provider, model string, task *models.Task, tools *ToolSet, systemPrompt string, history []models.ChatMessage, userMessage string, onStep StepCallback, onStream provider.StreamCallback) LoopResult {
+	var planSection string
+	if task.ImplementationPlan != "" {
+		planSection = fmt.Sprintf("\n\n## Current Implementation Plan\n%s", task.ImplementationPlan)
+	}
+
 	taskContext := fmt.Sprintf(`## Task Context
 Title: %s
 Description: %s
-
-Answer the user's question or help with their request. Use your tools to explore the codebase when needed.`, task.Title, task.Description)
+%s
+Answer the user's question or help with their request. Use your tools to explore the codebase when needed.`, task.Title, task.Description, planSection)
 
 	if len(history) > 0 {
 		taskContext = ""
